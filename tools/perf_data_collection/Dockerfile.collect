@@ -1,0 +1,89 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+# ============================================================
+# 性能数据库采集环境镜像（Linux + 昇腾 NPU + Docker）
+#
+# 用途：为 collect_device_database.sh 提供 CANN / torch_npu / msprof / vLLM-Ascend
+#       运行环境，在目标 NPU 设备上执行四阶段采集，产出标准 data/<DEVICE>/ 目录。
+#
+# 重要说明：
+#   1) 本仓库此前【没有】提供任何 Dockerfile；这是首个采集环境镜像定义。
+#   2) CANN Toolkit / 驱动 / NPU 设备本身无法由 Dockerfile 安装：
+#      - 基础镜像必须使用与目标设备 CANN 版本匹配的【昇腾官方 CANN 镜像】
+#        （含 toolkit、msprof、torch_npu 适配层）；
+#      - NPU 设备节点、Ascend 驱动、dcmi、npu-smi 必须在 docker run 时从宿主机挂载；
+#      - 参见下方 docker run 示例与 docs/zh/quick_start/optix_agent_pd_disaggregation.md。
+#   3) 请按目标设备的 CANN 版本选择基础镜像 tag，例如：
+#        CANN 8.5  -> <ascend-cann-image>:8.5-...
+#        CANN 9.0.1 -> <ascend-cann-image>:9.0.1-...
+#      具体镜像地址/tag 以所在单位昇腾镜像仓库为准，通过 --build-arg 覆盖。
+#   4) 采集脚本用系统 python3（需能 import torch / torch_npu），不要在其 venv 里
+#      安装 vllm，以免与服务化部署栈冲突（见 msmodeling-env-installer Skill）。
+#
+# 构建：
+#   docker build -f tools/perf_data_collection/Dockerfile.collect \
+#     --build-arg CANN_IMAGE=<你的昇腾CANN基础镜像:tag> \
+#     -t msmodeling-prof-collect:latest .
+#
+# 运行（单机 8 卡示例，按实际卡数调整 --device）：
+#   docker run -it --rm --name prof-collect \
+#     --network host --ipc host --shm-size 16g \
+#     --device /dev/davinci0 --device /dev/davinci1 \
+#     --device /dev/davinci2 --device /dev/davinci3 \
+#     --device /dev/davinci4 --device /dev/davinci5 \
+#     --device /dev/davinci6 --device /dev/davinci7 \
+#     --device /dev/davinci_manager --device /dev/devmm_svm --device /dev/hisi_hdc \
+#     -v /usr/local/dcmi:/usr/local/dcmi:ro \
+#     -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro \
+#     -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro \
+#     -v /etc/ascend_install.info:/etc/ascend_install.info:ro \
+#     -v $(pwd):/workspace/msmodeling \
+#     -v /data/profiling:/data/profiling:ro \
+#     -w /workspace/msmodeling \
+#     --entrypoint /bin/bash msmodeling-prof-collect:latest
+#
+# 容器内进入后：
+#   source /usr/local/Ascend/ascend-toolkit/set_env.sh   # 若镜像未自动加载
+#   npu-smi info                                         # 确认卡可见
+#   bash tools/perf_data_collection/collect_device_database.sh --list-devices
+# ============================================================
+
+# 基础镜像：替换为与目标设备 CANN 版本匹配的昇腾官方 CANN 镜像
+ARG CANN_IMAGE=<ASCEND_CANN_IMAGE_WITH_TOOLKIT:TAG>
+FROM ${CANN_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PYTHONPATH=/workspace/msmodeling \
+    HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+
+# 基础镜像已含 toolkits 与 torch_npu 适配层的场景，只需补齐通用工具。
+# 若你的基础镜像缺少下列工具，保留安装；已含则可精简。
+RUN python3 -m pip install --no-cache-dir --upgrade pip -i https://mirrors.ustc.edu.cn/pypi/web/simple && \
+    python3 -m pip install --no-cache-dir -i https://mirrors.ustc.edu.cn/pypi/web/simple \
+        "uv" "pyyaml>=6.0.3" "numpy"
+
+WORKDIR /workspace/msmodeling
+
+# 项目 Python 依赖：优先用仓库自带脚本 uv sync（创建 .venv，可编辑安装本项目）。
+# 注意：采集入口 collect_device_database.sh 默认用 --python-bin python3（系统解释器），
+#       因为 torch_npu / CANN 绑定系统环境；.venv 仅用于纯仿真/CLI，不用于 NPU replay。
+# 若系统 python3 已具备采集所需依赖，可跳过此步（在运行时按需执行）。
+# COPY pyproject.toml uv.lock README.md ./
+# RUN uv sync --frozen
+
+CMD ["/bin/bash"]

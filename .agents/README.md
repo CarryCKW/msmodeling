@@ -1,0 +1,476 @@
+# msmodeling skills
+
+本目录存放 msmodeling 的 AI Native Skills。它们同时服务于通用 AI 客户端，不再要求复制到客户端专属目录。
+仓库级路由由 [AGENTS.md](../AGENTS.md) 负责，强制规则位于 [spec/](../spec/README.md)。
+>
+> **AI agents 必读**：请先阅读项目根目录的 [AGENTS.md](../AGENTS.md)，了解项目规范和 Skill 体系。
+
+## Table of Contents
+
+- [msmodeling skills](#msmodeling-skills)
+- [AI Native 工作流](#ai-native-工作流)
+- [GitCode CLI 能力](#gitcode-cli-能力)
+- [msmodeling-env-installer](#msmodeling-env-installer)
+- [model-adaptation](#model-adaptation)
+- [model-adaptation-validation-workflow](#model-adaptation-validation-workflow)
+- [model-adaptation-calibration-loop](#model-adaptation-calibration-loop)
+- [device_config](#device_config)
+- [op_mapping](#op_mapping)
+- [microbench](#microbench)
+- [profiling-database-lifecycle](#profiling-database-lifecycle)
+- [profiling-database-axis-density](#profiling-database-axis-density)
+- [text-generate-executor](#text-generate-executor)
+- [throughput-optimizer-executor](#throughput-optimizer-executor)
+- [throughput-optimizer-explainer](#throughput-optimizer-explainer)
+- [sig-review](#sig-review)
+
+## AI Native 工作流
+
+工作流 Skill 面向完整作业目标，组合 GitCode CLI、领域 Skill、本地 Git、测试和审计记录；被组合的 Skill
+仍可独立触发。
+
+| Skill | 场景 |
+|---|---|
+| `msmodeling-issue-draft` | 从模糊描述补齐事实、生成 Issue 草稿，并在确认后通过 CLI 提交 |
+| `msmodeling-my-issues-review` | 查询当前用户负责的开放 Issue，输出接受、拒绝或需补充信息的完整结论 |
+| `msmodeling-issue-delivery` | 将指定 Issue 编排至需求分析、设计、开发、Draft PR、CI 和 ready-for-review |
+| `sig-review` | 评论 /merge 启动合入、深度检视、CLI 行内评论、风险评级和合入建议 |
+| `msmodeling-ci-recovery` | 读取 openLiBing 结果、定位日志、修复、复验并循环至通过或明确阻塞 |
+| `msmodeling-review-feedback` | 分析和处理 PR 检视意见，验证修改并通过 CLI 回复 |
+| `profiling-database-lifecycle` | 串联轴密度规则、Shape 生成、NPU 采集、生产回放、异常审计和数据库 PR 发布 |
+| `model-adaptation-validation-workflow` | 先执行跑通级模型适配，再串联 Theory↔Runtime Shape/dtype 看护和 NPU 实测分层对账 |
+| `model-adaptation-calibration-loop` | 对非通过项进行人工映射审查、最小代码修正和受影响门禁复验 |
+
+默认是逐阶段确认的 `guided` 模式。用户明确给出仓库、Issue、分支和目标范围后，可切换为
+`autonomous`；安全、权限、门禁绕过、强制推送、审批和合并仍是硬停止点。
+
+## GitCode CLI 能力
+
+所有 GitCode Issue、PR、评论、评审、标签和状态操作必须调用 `gitcode` CLI。启动远端任务前运行：
+
+```bash
+gitcode version
+gitcode auth status
+gitcode schema "<required command>"
+python scripts/ai/check_gitcode_cli.py
+python scripts/ai/resolve_repository_context.py --json
+```
+
+canonical repository 为 `Ascend/msmodeling`，默认分支为 `master`；代码贡献的 source repository
+必须是与 canonical 不同的个人 Fork，并从 Git remote 动态识别。所有写操作显式指定 operation target。
+canonical PR 的 openLiBing 流水线由
+`gitcode-pipeline-analyzer` 分析。上游 Skills 版本与本仓适配记录在 `.agents/gitcode-skills.lock.json`。
+
+## msmodeling-env-installer
+
+msmodeling 环境安装器——将“安装 msmodeling 环境依赖”“`uv sync` 安装”“安装当前仓库 requirements.txt（legacy fallback）”“配置 PYTHONPATH / HF_ENDPOINT”等明确指向 msmodeling 的请求转换为可执行、可验证、可回溯的环境安装流程。用户只说“安装环境”或“安装依赖”时，需要先确认是否安装 msmodeling 当前仓库的环境依赖。
+
+### What it does
+
+引导 AI agent 按 RFC 中定义的流程完成开发环境初始化：
+
+1. **仓库根目录校验**：确认当前目录包含 `README.md` 和 `pyproject.toml`。
+2. **Python 与 uv 检查**：要求 Python `3.10+`，缺少 `uv` 时按镜像安装并解析真实可执行路径。
+3. **安装路径选择**：默认在仓库根目录执行 `uv sync`（自动创建 `.venv`、可编辑安装 msmodeling）；legacy fallback 使用 `requirements.txt` 前检查 `torch_npu`、`torch-npu` 和 `cudatoolkit`。
+4. **依赖安装与验证**：`uv sync` 后执行 `uv pip check` 与 `uv run msmodeling --help`。
+5. **环境变量配置**：按需设置当前会话 `PYTHONPATH` 和 `HF_ENDPOINT=https://hf-mirror.com`。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `msmodeling-env-installer/SKILL.md` | Skill 定义、触发场景、安装流程和安全规则 |
+| `msmodeling-env-installer/scripts/install-current-project-deps.ps1` | Windows PowerShell 自动化安装脚本 |
+| `msmodeling-env-installer/scripts/install-current-project-deps.sh` | Linux/macOS/WSL/Git Bash 自动化安装脚本 |
+
+### Quick start
+
+在对话中直接提出明确需求，例如“请帮我安装 msmodeling 环境依赖”“按 README 配置 msmodeling 环境”。如果只说“安装环境”，agent 需要先确认是否安装 msmodeling 当前仓库的环境依赖。
+
+Windows PowerShell 可以从仓库根目录直接运行：
+
+```powershell
+.\.agents\skills\msmodeling-env-installer\scripts\install-current-project-deps.ps1
+```
+
+Linux/macOS/WSL/Git Bash 可以从仓库根目录直接运行：
+
+```bash
+bash ./.agents/skills/msmodeling-env-installer/scripts/install-current-project-deps.sh
+```
+
+### Key constraints
+
+- 不修改 `requirements.txt`、README 或项目源码。
+- `uv sync` 会复用已有 `.venv` 并更新依赖，不默认持久化系统级环境变量。
+- 网络安装需要用户确认和工具权限授权。
+- `scripts/install-current-project-deps.ps1` 当前仅适用于 Windows PowerShell；Linux/macOS 使用 README 通用命令。
+
+---
+
+## model-adaptation
+
+TensorCast 新模型接入流程 skill（跑通级）——从仿真命令出发，引导 agent 运行 `model_adapter doctor`、审阅 `ModelProfile`、在正确位置适配新算子（算子声明 + 算力/内存性能属性）、处理 patch/bug AI task，并运行跑通验证（关键算子调用次数对账）。不依赖任何实测 profiling 数据。
+
+### What it does
+
+将新模型接入拆成确定性工具和人工 checkpoint：
+
+1. 收集必需输入：仿真命令（无实测数据输入）。
+2. 运行 doctor，审阅 candidate profile、human questions 和 ai tasks。
+3. 需要新算子时，在 `tensor_cast/ops/` 声明算子、在 `tensor_cast/performance_model/` 注册性能属性，并按需登记 attention 核心算子表。
+4. 对 patch/bug 场景使用 `ai_tasks[].prompt_text` 驱动用户或用户的 AI 助手生成代码，并要求人工 review。
+5. 运行 verify：仿真跑通 + attention/MoE gating 调用次数与模型公开结构对账；通过的验证可生成 ST guardrail 用例。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `model-adaptation/SKILL.md` | 新模型接入的核心工作流、新算子适配位置、人工 checkpoint 和验证要求 |
+
+### Quick start
+
+当用户说"接入新模型""生成 ModelProfile""根据 doctor report 继续适配""处理 patch AI task""运行跑通验证"时使用该 skill。
+
+### Key constraints
+
+- 不凭模型名猜 profile 字段。
+- doctor 不生成模型专属 patch 代码，只生成 AI task 和 prompt。
+- 本流程不接受任何实测数据输入（raw profiling、kernel 计数、实测时延）；精度对齐由下游精度工作流负责。
+- 不提交本地 walkthrough、私人路径或临时材料。
+
+---
+
+## model-adaptation-validation-workflow
+
+模型适配精度闭环执行 Skill。第一阶段调用当前 `model-adaptation`，完成 doctor、Profile 人工确认、关键算子次数 verify 和原始仿真命令；后续再执行 Shape/dtype 看护和可选 NPU profiling 分层对账。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `model-adaptation-validation-workflow/SKILL.md` | 主流程、人工停止点和完成标准 |
+| `model-adaptation-validation-workflow/references/execution.md` | Windows 命令、状态解释和 MiniMax-M2.7 示例 |
+| `model-adaptation-validation-workflow/assets/workflow-summary-template.md` | 统一人工摘要模板 |
+
+### Key constraints
+
+- 实测 profiling 不进入基础 `model-adaptation` 的 doctor/verify。
+- Profile 缺失、无效或与候选不一致时，必须暂停并等待用户选择 `确认注册`、`仅保留草稿` 或 `修改字段`。
+- Theory 缺失时阻塞，不从 Runtime trace 倒推预期。
+- 缺少 kernel CSV 或 TensorCast trace 时，profiling 保持 pending/incomplete，不能写成完整通过。
+
+---
+
+## model-adaptation-calibration-loop
+
+模型适配校准闭环 Skill。它消费上一 Skill 的非通过项，通过人工检查点确认算子映射，实施最小范围修复，并重跑受影响门禁及其下游验证。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `model-adaptation-calibration-loop/SKILL.md` | 校准循环、问题路由和停止条件 |
+| `model-adaptation-calibration-loop/assets/mapping-decision-template.yaml` | 人工映射决策模板 |
+
+### Key constraints
+
+- 不重新引入旧版 `evidence.yaml` 或 profiling 参数到基础 doctor/verify。
+- 不为通过测试而放宽容差、忽略必需算子或关闭目标量化/并行路径。
+- 生产 `op_mapping.yaml` 变更继续遵循 `op-mapping-generator` 的源码链路验证。
+
+---
+
+## device_config
+
+设备画像自然语言导入器——通过渐进式对话引导用户将自然语言硬件描述转换为 TensorCast `DeviceProfile`。
+
+### What it does
+
+引导 AI agent 通过渐进式对话流程：
+
+1. **渐进收集信息**：首轮只问硬件名称、资料来源和粒度偏好，每轮最多 2-3 个问题。
+2. **维护内部事实表**：`confirmed` / `ambiguous` / `missing` / `needs calibration`。
+3. **生成可运行 profile**：将用户确认的值、临时估值和兜底默认值全部写入 `tensor_cast/device.py`。
+4. **验证 + 输出 CLI 命令**：运行导入检查，输出 `--device <PROFILE_NAME>` 可执行命令。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `device_config/SKILL.md` | Skill 定义、约束条件和执行流程 |
+
+### Quick start
+
+在 Claude Code 对话中直接提出需求，例如"我要导入新的设备拓扑"，遵循 agent 的渐进式提问，逐步提供硬件规格。
+
+### Key constraints
+
+- `DeviceProfile.__post_init__` 会自动注册 profile，`name` 必须唯一。
+
+- 默认写入 `tensor_cast/device.py`，只有用户明确要求时才写入 `tensor_cast/device_profiles/`。
+
+- 所有默认值、估值和假设必须对用户可见，列入 `needs calibration`。
+
+---
+
+## op_mapping
+
+`op_mapping.yaml` 生成器——将 TensorCast 仿真算子映射到 NPU profiling 内核类型。
+
+### What it does
+
+通过并行子 Agent 团队（每个算子一个 Agent）追踪完整的 vLLM→CANN 调用链，生成 `op_mapping.yaml`。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `op-mapping/SKILL.md` | 核心执行流程、六阶段工作流 |
+| `op-mapping/op-mapping-template.yaml` | YAML 模板片段 |
+| `op-mapping/single-op-worker-prompt.md` | 单算子 Worker Agent 指令 |
+| `op-mapping/verifier-prompt.md` | 验证阶段指令 |
+| `op-mapping/ref/shape_matching_catalog.md` | TC tensor 与 NPU profiling shape 的 10 种差异 |
+| `op-mapping/ref/tc_input_count_rules.md` | `tc_input_count` 安全使用规则 |
+| `op-mapping/ref/zero_cost_classification.md` | 零开销算子分类规则 |
+
+### Quick start
+
+收集完所有输入（model、device、profiling CSV、repo 版本）后，agent 自动执行六阶段流程：GATHER → FORWARD MAPPING → REVERSE MAPPING → VERIFY → WRITE → COMMIT。
+
+### Key constraints
+
+- `kernel_type` 必须与 CSV 文件名完全一致（无 `.csv` 后缀）。
+
+- 三个映射路径：aten→OpPlugin→aclnn、torch_npu.npu_*→OpPlugin→aclnn、vllm-ascend 自定义/Triton。
+
+- `alternate_kernel_types` 必须在同一抽象层级，禁止用融合大 op 作为子 op 的备选。
+
+---
+
+## microbench
+
+Microbench Run Script 生成器——从 profiling CSV 生成可在 NPU 上重放的 `<KernelType>_run.py`。
+
+### What it does
+
+为 profiling 内核 CSV 生成可运行的 `tools/perf_data_collection/op_replay/<KernelType>_run.py`，用于 NPU 实测重放。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `microbench/SKILL.md` | Skill 定义和 repo 搜索顺序 |
+
+### Quick start
+
+用户提供 `kernel_type`、设备 profile、vllm_ascend 版本和 CSV 路径后，agent 生成可重放的 run script。
+
+### Key constraints
+
+- 优先使用本地已克隆的 repos，按指定路径搜索。
+
+- repo 缺失时按 `SKILL.md` 中提供的 clone 命令获取。
+
+- 生成的 run script 由 `run_all_op.py` / `profile_and_update_db.py` 调用。
+
+---
+
+## profiling-database-lifecycle
+
+实测算子性能数据库端到端工作流。它按生命周期设计调用现有 Skill 和生产工具，不新增重复的采集或审计算法。
+
+### What it does
+
+冻结基线，按轴密度 YAML 生成候选 Shape，在候选库采集 latency，执行生产 query replay 和异常审计，并携带证据形成数据库 PR。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `profiling_database_lifecycle/SKILL.md` | 各阶段入口、命令、handoff、失败处理和交付要求 |
+| [Wiki design/profiling_database_lifecycle.md](https://gitcode.com/Ascend/msmodeling.wiki/blob/main/design/profiling_database_lifecycle.md) | 生命周期流程、最低可用条件和阶段职责 |
+
+### Quick start
+
+在执行“数据库标准到采集、审计和发布”的完整更新，或需要定位每一步应该调用哪个 Skill、脚本和文件时使用该 Skill。
+
+### Key constraints
+
+- 基线数据库只读，Shape 生成和实测写回只操作候选目录。
+- 新轴或密度变化先调用轴密度 Skill；已有规则直接读取 YAML。
+- PR673 未合入时，异常审计阶段保持阻塞，不用自建替代实现。
+
+---
+
+## profiling-database-axis-density
+
+实测算子数据库轴密度定标 Skill。用于新增采集轴、修改轴范围或密度，以及检查采集代码和生成 Shape 是否满足 V1 最低基线。
+
+### What it does
+
+从生产采集与查询代码确认轴语义，冻结关键 query，比较密度候选，并检查 YAML、生成点集、最终 CSV 和生产查询回放的一致性。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `profiling_database_axis_density/SKILL.md` | 新轴和密度变更的定标、验收流程 |
+| `profiling_database_axis_density/axis_collection_density.yaml` | 可机读的 V1 最低轴密度数值 |
+| `profiling_database_axis_density/profiling_database_axis_collection_density_standard_zh.md` | 门禁、证据和证明边界 |
+
+### Quick start
+
+在新增 profiling database 轴、调整轴范围或间隔、审计生成 Shape 是否符合轴密度标准时使用该 Skill。
+
+### Key constraints
+
+- 不根据算子名猜轴，轴定义以生产采集和查询代码为准。
+- YAML 是规范数值，不是运行时配置；门禁以标准文档第 3 节为准。
+- 缺少连续密度证据时只登记 exact 锚点，不补造范围或间隔。
+
+---
+
+## text-generate-executor
+
+`text_generate` 单点验证执行器。用于把用户关于 `python -m cli.inference.text_generate` 的验证诉求转换为可确认、可执行的 CLI 命令，并在确认后运行和总结结果。
+
+### What it does
+
+面向已有模型、硬件、batch/query length、prefill 或 decode 模式、固定 TP/DP/EP/MOE 策略、profiling database、trace/debug 或 throughput optimizer 最优行复验的场景，生成单点仿真命令。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `text-generate-executor/SKILL.md` | Skill 主说明、默认策略、校验规则和 handoff 规则 |
+| `text-generate-executor/references/dialog-flow.md` | 渐进式问参流程 |
+| `text-generate-executor/references/text-generate-params.md` | `text_generate` 参数速查 |
+
+### Quick start
+
+提出“帮我跑 text_generate 验证”“把 throughput_optimizer 最优行转 text_generate 跑一下”“导出 chrome trace”等请求时，agent 会补齐缺失参数，展示命令和假设，并在用户确认后执行。
+
+### Key constraints
+
+- 执行前必须展示完整命令和关键假设，并要求显式确认。
+- Decode 模式必须确认 `--context-length`；profiling 模式必须提供 `--profiling-database`。
+- `text_generate` 只验证固定候选，不执行 TP/EP/MOE-DP 搜索。
+
+---
+
+## throughput-optimizer-executor
+
+`throughput_optimizer` 部署规划执行器。用于把吞吐规划、硬件对比、并行搜索、PD 聚合/分离/配比优化等自然语言诉求转换为 `python -m cli.inference.throughput_optimizer` 命令。
+
+### What it does
+
+面向搜索和规划场景，收集模型、硬件、设备数、输入/输出长度、SLO、部署模式和搜索空间，生成 optimizer 命令，在确认后运行并总结最佳并行策略、batch、concurrency、throughput、TTFT、TPOT 和 PD ratio 信息。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `throughput-optimizer-executor/SKILL.md` | Skill 主说明、默认策略、校验规则和 handoff 规则 |
+| `throughput-optimizer-executor/references/dialog-flow.md` | 部署模式识别和渐进式问参流程 |
+| `throughput-optimizer-executor/references/throughput-optimizer-params.md` | `throughput_optimizer` 参数速查 |
+| `throughput-optimizer-executor/scripts/extract_throughput_optimizer_result.py` | optimizer stdout 结构化摘要脚本 |
+
+### Quick start
+
+提出“比较两种硬件”“搜索 Qwen 32B 最佳 TP”“做 PD 分离能力评估”“算 P/D 实例配比”等请求时，agent 会识别 aggregation、disagg 或 PD ratio 模式，补齐 SLO 和搜索空间，并在确认后执行。
+
+### Key constraints
+
+- `--enable-optimize-prefill-decode-ratio` 不能与 `--disagg` 同时使用。
+- 多硬件对比共用同一个 `--num-devices`，需要在执行前说明。
+- 执行前需要明确确认是否开启 prefix cache 和 MTP；开启后分别补齐 hit rate、MTP token 数和接受率假设。
+- 该 skill 做候选搜索和规划；单点复验应 handoff 到 `text-generate-executor`。
+- 结果合理性、硬件差异、Cube/Vec/Comm/Mem 和 best row 映射解释应 handoff 到 `throughput-optimizer-explainer`。
+
+---
+
+## throughput-optimizer-explainer
+
+`throughput_optimizer` 结果解释器。用于分析 optimizer 输出是否合理、比较硬件或并行策略差异、解释 Prefill/Decode 阶段的 Cube/Vec/Comm/Mem 瓶颈，并把最优行映射为 `text_generate` 验证命令。
+
+### What it does
+
+围绕 optimizer 结果建立证据分级和解释边界：
+
+1. 识别 aggregation、disaggregation 或 PD ratio 模式。
+2. 提取模型、硬件、输入/输出长度、SLO、量化、compile、prefix cache、MTP 和搜索空间等可比条件。
+3. 提取 best row、top candidates、throughput、TTFT、TPOT、concurrency、batch、并行策略、PD ratio、QPS 和 breakdown。
+4. 按 `macro_only`、`optimizer_phase_breakdown`、`text_generate_phase_breakdown`、`text_generate_op_bound`、`profiler_trace` 判断证据等级。
+5. aggregation 结果必须拆成 Prefill forward、Decode forward 和调度公式，不能当成单次 forward。
+6. 需要 operator 级归因时，使用 `text_generate --dump-op-bound-results`，并明确它是 TensorCast 模拟归因而不是真实 profiler 证据。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `throughput-optimizer-explainer/SKILL.md` | Skill 主说明、证据规则、工作流、映射规则和输出要求 |
+| `throughput-optimizer-explainer/references/aggregation-mapping.md` | aggregation best row 到 Prefill/Decode 验证命令的映射 |
+| `throughput-optimizer-explainer/references/disaggregation-mapping.md` | disaggregation 和 PD ratio 结果到 `text_generate` 的映射 |
+| `throughput-optimizer-explainer/references/evidence-levels.md` | 证据等级、可支持结论和禁止过度推断的规则 |
+| `throughput-optimizer-explainer/references/bottleneck-rules.md` | Cube/Vec/Comm/Mem 与并行策略解释规则 |
+| `throughput-optimizer-explainer/references/output-template.md` | 简洁输出模板 |
+| `throughput-optimizer-explainer/scripts/parse_optimizer_output.py` | 解析 optimizer、dump 表、`text_generate` breakdown 和 op-bound 表为 JSON |
+| `throughput-optimizer-explainer/scripts/build_text_generate_commands.py` | 从 normalized best row JSON 生成 Prefill/Decode 验证命令 |
+| `throughput-optimizer-explainer/scripts/compare_phase_breakdowns.py` | 对比 Cube/Vec/Comm/Mem 或 op-bound 表差异 |
+
+### Quick start
+
+当用户问“这个 throughput_optimizer 结果是否合理”“为什么 A3 比 A2 快/慢”“Cube/Vec/Comm/Mem 谁是瓶颈”“把 best row 转成 text_generate 验证命令”时使用该 skill。
+
+### Key constraints
+
+- 只有宏观输出时，只能做部署、阶段和策略层面的推断，不能断言具体 operator 或真实 kernel 瓶颈。
+- `text_generate --dump-op-bound-results` 是 TensorCast 模拟 operator 归因，必须与真实 profiler/kernel 证据区分。
+- aggregation throughput 不是单次 forward TPS；解释和复验时必须拆成 Prefill 与 Decode 两条验证命令。
+
+---
+
+## sig-review
+
+GitCode CLI 驱动的 SIG 检视技能。它保留目录到 SIG 的路由、多角色检查清单和 reviewer/approver 建议，
+并将所有远端操作统一收敛到 `gitcode` CLI。
+
+### What it does
+
+引导 AI agent 完成端到端的 PR 代码检视：
+
+1. **读取远端事实**：通过 `gitcode pr view/diff/comments` 获取 PR、权威 diff 和已有评论。
+2. **SIG 路由**：用 `sig_ownership.json` 最长前缀匹配建议 reviewer/approver。
+3. **多角色分析**：执行架构、正确性、领域、性能、测试、安全、文档和 CI 检查。
+4. **二次核验**：确认问题由本 PR 引入、影响成立、建议可执行、目标行属于新增或修改行。
+5. **提交意见**：确认后通过 `gitcode pr comment --path --position` 写入行内评论。
+6. **总体结论**：通过 `gitcode pr review` 提交风险与合入建议，不自动审批或合并。
+
+### File layout
+
+| File | Purpose |
+| ---- | ------- |
+| `sig-review/SKILL.md` | Skill 定义、分配检视流程、代码检视流程、评论格式规范 |
+| `sig-review/sig_ownership.json` | SIG 目录归属映射表（9 个 SIG 的路径、chair、reviewer、approver） |
+| `sig-review/ref/review-checklist.md` | 检视质量标准、什么该 / 不该检视、msmodeling 专项关注 |
+
+### Quick start
+
+```bash
+gitcode auth status
+gitcode pr view 123 -R Ascend/msmodeling --json
+gitcode pr diff 123 -R Ascend/msmodeling
+gitcode pr comments 123 -R Ascend/msmodeling --json
+gitcode pr comment 123 -R Ascend/msmodeling \
+  --path tensor_cast/core/config.py --position 42 \
+  --body "【review】【逻辑缺陷】缺少空值处理。"
+```
+
+### Key constraints
+
+- PR 变更的远端权威来源是 `gitcode pr diff`；本地工作树只用于补充上下文。
+- `--position` 是新版本文件的实际行号，不是 unified diff 偏移量。
+- SIG 路由使用最长前缀匹配；跨 SIG 变更需要列出所有相关 SIG。
+- 多角色分析不冒充多个独立评审主体。
+- 评论必须提交在 diff 中新增或修改的行上，不能提交在未修改的上下文行上。

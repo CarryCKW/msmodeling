@@ -1,0 +1,95 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+from typing import Tuple
+
+import torch
+
+from ..utils import register_tensor_cast_op
+
+
+@register_tensor_cast_op("apply_rope")
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_embed, k_embed = torch.empty_like(query), torch.empty_like(key)
+    q_embed = q_embed.transpose(1, 2)
+    k_embed = k_embed.transpose(1, 2)
+    return q_embed.contiguous(), k_embed.contiguous()
+
+
+@register_tensor_cast_op("apply_rope_single")
+def _(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox: bool = True,
+    transpose_output: bool = True,
+) -> torch.Tensor:
+    """Return single-RoPE output metadata, optionally transposing BHSD to BSHD."""
+    del cos, sin, is_neox
+    if transpose_output:
+        # The fused op converts its BHSD input layout to BSHD.
+        return torch.empty_like(x).transpose(1, 2).contiguous()
+    return torch.empty_like(x).contiguous()
+
+
+@register_tensor_cast_op("apply_rope_inplace", mutates_args=("x",))
+def _(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox: bool = True,
+    inverse: bool = False,
+    rope_head_dim: int = -1,
+) -> torch.Tensor:
+    # In-place RoPE on the trailing `rope_head_dim` channels of x.
+    # When rope_head_dim < 0, rotate the full last dimension.
+    del cos, sin, is_neox, inverse, rope_head_dim
+    return x
+
+
+@register_tensor_cast_op("fused_rope")
+def _(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin: torch.Tensor,
+    rotary_dim: int,
+    is_neox_style: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused rotary position embedding (RoPE) for Q and K tensors.
+
+    Matches the NPU profiling operator InterleaveRope / fused_rope_qk_mqa
+    which fuses cos/sin lookup + partial RoPE application into a single kernel.
+    Signature matches sgl_kernel_npu.fused_rope_qk_mqa used in sglang NPU.
+
+    Args:
+        query: (num_tokens, num_heads, head_dim) 3D query tensor.
+        key: (num_tokens, num_kv_heads, head_dim) 3D key tensor.
+        cos_sin: (num_tokens, rotary_dim * 2) concatenated cos/sin for positions.
+        rotary_dim: dimension to apply rotary embedding (partial RoPE).
+        is_neox_style: True for GPT-NeoX style (rotate_half), False for interleaved.
+
+    Returns:
+        query_out: same shape as query.
+        key_out: same shape as key.
+    """
+    del cos_sin, rotary_dim, is_neox_style
+    return query.clone(), key.clone()

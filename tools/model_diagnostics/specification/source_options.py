@@ -1,0 +1,283 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Injectable parsers for source-specific stage options."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+import re
+from typing import TYPE_CHECKING, Protocol
+
+from tools.model_diagnostics.domain.models import INPUT, OUTPUT, SourceKind, TensorSlot
+from tools.model_diagnostics.domain.specification import (
+    DTypeExpr,
+    RuntimeStageOptions,
+    ShapeExpr,
+    SourceStageOptions,
+    TheoryOperatorSpec,
+    TheoryStageOptions,
+    TheoryTensorSpec,
+)
+from tools.model_diagnostics.schema_utils import SchemaGuard
+from tools.model_diagnostics.specification.errors import SpecificationLoadError
+from tools.model_diagnostics.specification.ignore_groups import (
+    expand_ignore_groups,
+    load_builtin_ignore_groups,
+    merge_operator_names,
+)
+
+if TYPE_CHECKING:
+    from tools.model_diagnostics.specification.theory_fragments import TheoryFragmentRegistry
+
+_SCHEMA = SchemaGuard(
+    error=SpecificationLoadError,
+    accept_any_mapping=True,
+    kind_mapping="mapping",
+    kind_list="list",
+    text_non_empty=True,
+    require_string_keys=True,
+)
+_exact_keys = _SCHEMA.exact_keys
+_require_mapping = _SCHEMA.mapping
+_require_list = _SCHEMA.sequence
+_as_str = _SCHEMA.text
+
+
+class SourceOptionsParser(Protocol):
+    source_kind: SourceKind
+    yaml_key: str
+
+    def parse(self, raw: Mapping[str, object]) -> SourceStageOptions: ...
+
+
+@dataclass(frozen=True)
+class TheorySourceOptionsParser:
+    source_kind = SourceKind.THEORY
+    yaml_key = "theory"
+    fragment_registry: TheoryFragmentRegistry | None = None
+
+    def parse(self, raw: Mapping[str, object]) -> TheoryStageOptions:
+        _exact_keys(
+            raw,
+            required=set(),
+            optional={"modules", "include_module_groups", "include_stages", "repeat"},
+            label="theory options",
+        )
+        operators: list[TheoryOperatorSpec] = []
+        if "modules" in raw:
+            operators.extend(
+                parse_theory_operator(item, index)
+                for index, item in enumerate(_require_list(raw.get("modules"), "theory.modules"))
+            )
+        if "include_module_groups" in raw:
+            if self.fragment_registry is None:
+                raise SpecificationLoadError(
+                    "theory.include_module_groups requires a TheoryFragmentRegistry"
+                )
+            for index, item in enumerate(
+                _require_list(raw.get("include_module_groups"), "theory.include_module_groups")
+            ):
+                location = f"theory.include_module_groups[{index}]"
+                ref = _require_mapping(item, location)
+                _exact_keys(ref, required={"fragment", "group"}, label=location)
+                fragment_id = _as_str(ref.get("fragment"), f"{location}.fragment")
+                group_id = _as_str(ref.get("group"), f"{location}.group")
+                operators.extend(self.fragment_registry.get(fragment_id).group(group_id))
+        if "include_stages" in raw:
+            if self.fragment_registry is None:
+                raise SpecificationLoadError(
+                    "theory.include_stages requires a TheoryFragmentRegistry"
+                )
+            for index, item in enumerate(
+                _require_list(raw.get("include_stages"), "theory.include_stages")
+            ):
+                location = f"theory.include_stages[{index}]"
+                ref = _require_mapping(item, location)
+                _exact_keys(ref, required={"fragment", "stage"}, label=location)
+                fragment_id = _as_str(ref.get("fragment"), f"{location}.fragment")
+                stage_id = _as_str(ref.get("stage"), f"{location}.stage")
+                operators.extend(self.fragment_registry.get(fragment_id).stage(stage_id).operators)
+        if not operators:
+            raise SpecificationLoadError(
+                "theory options must declare modules, include_module_groups, and/or include_stages"
+            )
+        return TheoryStageOptions(
+            operators=tuple(operators),
+            repeat=(
+                _as_str(raw.get("repeat"), "theory.repeat") if "repeat" in raw else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeSourceOptionsParser:
+    source_kind = SourceKind.RUNTIME
+    yaml_key = "runtime"
+    ignore_groups: Mapping[str, tuple[str, ...]] = field(
+        default_factory=load_builtin_ignore_groups
+    )
+
+    def parse(self, raw: Mapping[str, object]) -> RuntimeStageOptions:
+        _exact_keys(
+            raw,
+            required={"boundary_operators"},
+            optional={"ignored_operator_groups", "ignored_operators"},
+            label="runtime options",
+        )
+        return RuntimeStageOptions(
+            boundary_operators=self._operator_names(
+                raw.get("boundary_operators"),
+                "runtime.boundary_operators",
+            ),
+            ignored_operators=self._ignored_operators(
+                raw,
+                label="runtime",
+            ),
+        )
+
+    def parse_override(
+        self,
+        raw: Mapping[str, object],
+        *,
+        label: str,
+    ) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
+        _exact_keys(
+            raw,
+            required=set(),
+            optional={"boundary_operators", "ignored_operator_groups", "ignored_operators"},
+            label=label,
+        )
+        if not {"boundary_operators", "ignored_operator_groups", "ignored_operators"}.intersection(raw):
+            raise SpecificationLoadError(
+                f"{label} must declare boundary_operators and/or ignored_operators"
+            )
+        boundaries = (
+            None
+            if "boundary_operators" not in raw
+            else self._operator_names(
+                raw.get("boundary_operators"),
+                f"{label}.boundary_operators",
+            )
+        )
+        ignored = self._ignored_operators(raw, label=label)
+        return boundaries, ignored
+
+    def _ignored_operators(
+        self,
+        raw: Mapping[str, object],
+        *,
+        label: str,
+    ) -> tuple[str, ...]:
+        groups = (
+            ()
+            if "ignored_operator_groups" not in raw
+            else expand_ignore_groups(
+                _require_list(
+                    raw.get("ignored_operator_groups"),
+                    f"{label}.ignored_operator_groups",
+                ),
+                registry=self.ignore_groups,
+                label=f"{label}.ignored_operator_groups",
+            )
+        )
+        local = (
+            ()
+            if "ignored_operators" not in raw
+            else self._operator_names(
+                raw.get("ignored_operators"),
+                f"{label}.ignored_operators",
+            )
+        )
+        return merge_operator_names(groups, local)
+
+    @staticmethod
+    def _operator_names(raw: object, label: str) -> tuple[str, ...]:
+        names = tuple(_as_str(item, "runtime operator") for item in _require_list(raw, label))
+        if len(names) != len(set(names)):
+            raise SpecificationLoadError(f"{label} contains duplicate operators")
+        return names
+
+
+def create_builtin_source_options_parsers(
+    *,
+    fragment_registry: TheoryFragmentRegistry | None = None,
+) -> Mapping[str, SourceOptionsParser]:
+    from tools.model_diagnostics.specification.theory_fragments import (
+        load_builtin_theory_fragment_registry,
+    )
+
+    registry = fragment_registry if fragment_registry is not None else load_builtin_theory_fragment_registry()
+    parsers: tuple[SourceOptionsParser, ...] = (
+        TheorySourceOptionsParser(fragment_registry=registry),
+        RuntimeSourceOptionsParser(),
+    )
+    return {parser.yaml_key: parser for parser in parsers}
+
+
+_TENSOR_SLOT_KEY = re.compile(r"^(INPUT|OUTPUT)\[(0|[1-9][0-9]*)\]$")
+
+
+def _tensor_slot_key(value: object, label: str) -> TensorSlot:
+    key = _as_str(value, label)
+    match = _TENSOR_SLOT_KEY.fullmatch(key)
+    if match is None:
+        raise SpecificationLoadError(f"{label} has invalid Tensor slot syntax: {key!r}")
+    index = int(match.group(2))
+    return INPUT[index] if match.group(1) == "INPUT" else OUTPUT[index]
+
+
+def parse_theory_operator(value: object, index: int) -> TheoryOperatorSpec:
+    location = f"theory.modules[{index}]"
+    raw = _require_mapping(value, location)
+    _exact_keys(raw, required={"name", "tensors"}, optional={"activation"}, label=location)
+    tensors_raw = _require_mapping(raw.get("tensors"), f"{location}.tensors")
+    if not tensors_raw:
+        raise SpecificationLoadError(f"{location}.tensors must not be empty")
+    tensors: dict[TensorSlot, TheoryTensorSpec] = {}
+    for key, tensor in tensors_raw.items():
+        slot = _tensor_slot_key(key, f"{location}.tensor key")
+        if slot in tensors:
+            raise SpecificationLoadError(f"{location}.tensors has duplicate Tensor slot: {key!r}")
+        tensors[slot] = _theory_tensor(tensor, f"{location}.tensors[{key}]")
+    return TheoryOperatorSpec(
+        operator_name=_as_str(raw.get("name"), f"{location}.name"),
+        tensors=tensors,
+        activation=(
+            _as_str(raw["activation"], f"{location}.activation") if "activation" in raw else None
+        ),
+    )
+
+
+# Back-compat alias for fragment loader.
+_theory_operator = parse_theory_operator
+
+
+def _theory_tensor(value: object, location: str) -> TheoryTensorSpec:
+    raw = _require_mapping(value, location)
+    _exact_keys(
+        raw,
+        required=set(),
+        optional={"shape", "dtype"},
+        label=location,
+    )
+    if not raw:
+        raise SpecificationLoadError(f"{location} must declare shape or dtype")
+    return TheoryTensorSpec(
+        shape=(ShapeExpr(_as_str(raw["shape"], f"{location}.shape")) if "shape" in raw else None),
+        dtype=(DTypeExpr(_as_str(raw["dtype"], f"{location}.dtype")) if "dtype" in raw else None),
+    )

@@ -1,0 +1,70 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+
+class SimpleArgs:
+    def __init__(self):
+        self.model_id = "Qwen/Qwen3-8B"
+        self.device = "TEST_DEVICE"
+        self.compile = True
+        self.compile_allow_graph_break = False
+        self.num_mtp_tokens = 0
+        self.mtp_acceptance_rate = [0.9, 0.8]
+        self.quantize_linear_action = "DISABLED"
+        self.mxfp4_group_size = 128
+        self.quantize_attention_action = "DISABLED"
+        self.max_batched_tokens = 2048
+        self.input_length = 100
+        self.output_length = 100
+        self.ttft_limits = None
+        self.tpot_limits = 100
+        self.disagg = False
+        self.tp_sizes = []
+        self.pp_sizes = None
+        self.ep_sizes = None
+        self.moe_dp_sizes = None
+        self.dcp_sizes = None
+        self.num_devices = 1
+        self.batch_range = None
+        self.log_level = "INFO"
+        self.image_batch_size = None
+        self.image_height = 520
+        self.image_width = 520
+        self.prefill_devices_per_instance = None
+        self.decode_devices_per_instance = None
+        self.serving_cost = 0
+        self.enable_optimize_prefill_decode_ratio = False
+        self.prefix_cache_hit_rate = 0.0
+        self.concurrency_search_strategy = "exponential"
+        # Draft-spec defaults (G1: disabled unless tests enable them).
+        self.speculative_method = None
+        self.num_speculative_tokens = 0
+        self.acceptance_length = 5.0
+        self.draft_block_size = 0
+        self.dspark_markov_rank = 256
+        self.dspark_markov_head = "vanilla"
+        self.num_draft_layers = 0
+        self.draft_model_config_path = None
+        self.chrome_trace = None
+        self.num_mtp_token_sizes = []
+        self.max_search_combinations = 0
+        self.search_combination_warning_emitted = False
+        self.compilation_config = None
+        self.performance_model = "analytic"
+        self.profiling_database = None
+        self.word_embedding_tp = None
+        self.enable_shared_expert_tp = False
+        self.quantize_non_expert_linear_action = "DISABLED"

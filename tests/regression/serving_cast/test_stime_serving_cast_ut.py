@@ -1,0 +1,67 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2025-2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import unittest
+
+import serving_cast.stime as stime
+
+
+class TestCallableTask(unittest.TestCase):
+    def setUp(self):
+        stime.init_simulation()
+
+    def test_callable_task_basic(self):
+        """Test CallableTask with basic function."""
+        result = []
+
+        def test_func(value):
+            result.append(value)
+
+        task = stime.CallableTask(test_func, 42)
+        task.process()
+        self.assertEqual(result, [42])
+
+    def test_callable_task_with_kwargs(self):
+        """Test CallableTask with kwargs."""
+        result = []
+
+        def test_func(a, b, c=10):
+            result.append(a + b + c)
+
+        task = stime.CallableTask(test_func, 1, 2, c=3)
+        task.process()
+        self.assertEqual(result, [6])
+
+    def test_callable_task_simulation(self):
+        """Test CallableTask in simulation."""
+        execution_order = []
+
+        def func1():
+            execution_order.append("func1_start")
+            stime.elapse(1.0)
+            execution_order.append("func1_end")
+
+        def func2():
+            execution_order.append("func2_start")
+            stime.elapse(1.0)
+            execution_order.append("func2_end")
+            stime.stop_simulation()
+
+        _ = stime.CallableTask(func1)
+        _ = stime.CallableTask(func2)
+        stime.start_simulation()
+        # func1 should complete before func2 starts due to sequential execution
+        self.assertIn("func1_start", execution_order)

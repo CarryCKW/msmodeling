@@ -1,0 +1,655 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Diagnostics-owned orchestration over an existing msmodeling ModelRunner."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+from tools.model_diagnostics.domain import (
+    ARTIFACT_SCHEMA_VERSION,
+    INPUT,
+    OUTPUT,
+    ModelRunContext,
+    OperatorCallRecord,
+    ParallelContext,
+    ProducerInfo,
+    SimulationExecutionArtifact,
+    TensorInfo,
+    validate_expert_parallel_features,
+)
+from tools.model_diagnostics.domain.constants import VISION_IMAGE_BOUNDARY_TOKEN_COUNT
+from tools.model_diagnostics.errors import SourceLoadError
+from tools.model_diagnostics.specification.layer_layout import (
+    qwen3_vl_moe_layer_kinds,
+)
+from tensor_cast.runtime import Runtime
+
+_CAPTURE_BACKEND = "tensor_cast.runtime_observer"
+
+
+def _vision_spatial_merge_size(vision_config: object) -> int | None:
+    """Return the scalar side length used by square vision patch merging."""
+
+    field_name = "spatial_merge_size"
+    value = getattr(vision_config, field_name, None)
+    if value is None:
+        field_name = "merge_kernel_size"
+        value = getattr(vision_config, field_name, None)
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise SourceLoadError(
+                f"vision_config.{field_name} must be a square two-element kernel, got {value!r}"
+            )
+        merge_height, merge_width = value
+        if (
+            isinstance(merge_height, bool)
+            or not isinstance(merge_height, int)
+            or merge_height <= 0
+            or isinstance(merge_width, bool)
+            or not isinstance(merge_width, int)
+            or merge_width <= 0
+            or merge_height != merge_width
+        ):
+            raise SourceLoadError(
+                f"vision_config.{field_name} must be a positive square kernel, got {value!r}"
+            )
+        return merge_height
+
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SourceLoadError(
+            f"vision_config.{field_name} must be a positive integer or square kernel, got {value!r}"
+        )
+    return value
+
+
+def _is_moe_config(config: object) -> bool:
+    """Return whether the loaded HF config exposes routed-MoE fields."""
+
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else config
+    has_routed_experts = any(
+        getattr(text_config, key, None) is not None or getattr(config, key, None) is not None
+        for key in ("num_experts", "n_routed_experts")
+    )
+    has_topk = (
+        getattr(text_config, "num_experts_per_tok", None) is not None
+        or getattr(config, "num_experts_per_tok", None) is not None
+    )
+    return has_routed_experts and has_topk
+
+
+def _model_is_moe(model_name: str) -> bool:
+    """Classify a model from a fresh config to avoid stale same-name layouts."""
+
+    from tensor_cast.transformers.utils import AutoModelConfigLoader
+
+    loaded_config = AutoModelConfigLoader().load_config(model_name)
+    if loaded_config is None:
+        raise SourceLoadError("failed to load model config before Runtime capture")
+    return _is_moe_config(loaded_config)
+
+
+def _validate_moe_capture_parallel(parallel: ParallelContext) -> None:
+    """Validate the diagnostics MoE layout with MoE tensor parallel fixed at 1."""
+
+    tp = parallel.tensor_parallel_size
+    pp = parallel.pipeline_parallel_size
+    dp = parallel.data_parallel_size
+    ep = parallel.expert_parallel_size
+    mdp = parallel.moe_data_parallel_size
+    world_size = tp * dp * pp
+    moe_world_size = world_size // pp
+    if mdp * ep != moe_world_size:
+        raise SourceLoadError(
+            f"moe_data_parallel_size ({mdp}) * expert_parallel_size ({ep}) must equal "
+            f"pipeline stage world_size ({moe_world_size}) "
+            f"derived from world_size ({world_size}) / pipeline_parallel_size ({pp}). "
+            f"Fix parallel.data_parallel_size / expert_parallel_size / moe_data_parallel_size "
+            f"in the diagnostics profile (diagnostics does not auto-adjust). "
+            f"MoE tensor parallel is fixed at 1 by this module."
+        )
+
+
+@dataclass
+class RuntimeArtifactCapture:
+    """One-shot capture boundary around one Runtime instance."""
+
+    _runtime: object
+    _start_invocation_index: int
+    _run_context: ModelRunContext
+    _finished: bool = False
+
+    @classmethod
+    def begin(cls, runtime: object, *, run_context: ModelRunContext) -> RuntimeArtifactCapture:
+        invocations = getattr(runtime, "op_invoke_infos", None)
+        if invocations is None:
+            raise SourceLoadError("runtime does not expose op_invoke_infos")
+        return cls(runtime, len(invocations), run_context)
+
+    @staticmethod
+    def snapshot(
+        runtime: object,
+        *,
+        run_context: ModelRunContext,
+        producer: ProducerInfo,
+        start_invocation_index: int | None = None,
+    ) -> SimulationExecutionArtifact:
+        """Capture neutral evidence from a completed Runtime execution."""
+
+        return _build_runtime_artifact(
+            runtime,
+            start_invocation_index=start_invocation_index,
+            run_context=run_context,
+            producer=producer,
+        )
+
+    def finish(self, runtime: object, *, producer: ProducerInfo) -> SimulationExecutionArtifact:
+        if runtime is not self._runtime:
+            raise SourceLoadError("capture must finish with the same runtime used at begin")
+        if self._finished:
+            raise RuntimeError("capture session has already finished")
+        artifact = RuntimeArtifactCapture.snapshot(
+            runtime,
+            run_context=self._run_context,
+            producer=producer,
+            start_invocation_index=self._start_invocation_index,
+        )
+        self._finished = True
+        return artifact
+
+
+def _iter_tensor_leaves(value: Any) -> Iterable[Any]:
+    if hasattr(value, "shape") and hasattr(value, "dtype"):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _iter_tensor_leaves(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_tensor_leaves(item)
+
+
+def _normalize_dtype(dtype: object) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _config_dtype(config: object) -> str | None:
+    """Read a supported dtype declared by either generation of HF config schema."""
+    supported = {"float16", "fp16", "half", "bfloat16", "bf16", "float32", "fp32", "float"}
+    for field_name in ("torch_dtype", "dtype"):
+        value = getattr(config, field_name, None)
+        if value is not None:
+            dtype = _normalize_dtype(value).lower()
+            if dtype in supported:
+                return dtype
+    return None
+
+
+def _config_dtypes(configs: Iterable[object]) -> Iterable[str]:
+    """Yield supported dtype declarations in outer-config-first order."""
+    for config in configs:
+        if (dtype := _config_dtype(config)) is not None:
+            yield dtype
+
+
+def _tensor_info(tensor: object, *, is_output: bool, index: int) -> TensorInfo:
+    try:
+        shape = tuple(int(dimension) for dimension in tensor.shape)
+    except (TypeError, ValueError) as error:
+        raise SourceLoadError("captured tensor has an invalid shape") from error
+    slot = OUTPUT[index] if is_output else INPUT[index]
+    return TensorInfo(slot=slot, shape=shape, dtype=_normalize_dtype(tensor.dtype))
+
+
+def _capture_tensors(invocation: object) -> tuple[TensorInfo, ...]:
+    inputs = tuple(_iter_tensor_leaves((invocation.args, invocation.kwargs)))
+    outputs = tuple(_iter_tensor_leaves(invocation.out))
+    return tuple(_tensor_info(tensor, is_output=False, index=index) for index, tensor in enumerate(inputs)) + tuple(
+        _tensor_info(tensor, is_output=True, index=index) for index, tensor in enumerate(outputs)
+    )
+
+
+def _build_runtime_artifact(
+    runtime: object,
+    *,
+    start_invocation_index: int | None,
+    run_context: ModelRunContext,
+    producer: ProducerInfo,
+) -> SimulationExecutionArtifact:
+    events = getattr(runtime, "event_list", None)
+    if events is None:
+        raise SourceLoadError("runtime does not expose event_list")
+    included_invocation_ids: set[int] | None = None
+    if start_invocation_index is not None:
+        invocations = getattr(runtime, "op_invoke_infos", None)
+        if invocations is None:
+            raise SourceLoadError("runtime does not expose op_invoke_infos")
+        if isinstance(start_invocation_index, bool) or not isinstance(start_invocation_index, int):
+            raise TypeError("start_invocation_index must be an integer")
+        if start_invocation_index < 0:
+            raise SourceLoadError("start_invocation_index must be non-negative")
+        if start_invocation_index > len(invocations):
+            raise SourceLoadError("start_invocation_index must not exceed the runtime invocation count")
+        included_invocation_ids = {id(invocation) for invocation in invocations[start_invocation_index:]}
+
+    calls: list[OperatorCallRecord] = []
+    for source_event_index, event in enumerate(events):
+        invocation = getattr(event, "op_invoke_info", None)
+        if included_invocation_ids is not None and id(invocation) not in included_invocation_ids:
+            continue
+        func = getattr(invocation, "func", None)
+        if func is None:
+            raise SourceLoadError(f"runtime event {source_event_index} does not expose func")
+        operator_name = str(func)
+        if not operator_name.strip():
+            raise SourceLoadError(f"runtime event {source_event_index} has an empty func")
+        calls.append(
+            OperatorCallRecord(
+                call_index=len(calls),
+                operator_name=operator_name,
+                original_operator_name=None,
+                tensors=_capture_tensors(invocation),
+                source_reference=f"runtime.event_list[{source_event_index}]",
+            )
+        )
+    return SimulationExecutionArtifact(
+        schema_version=ARTIFACT_SCHEMA_VERSION,
+        producer=producer,
+        run_context=run_context,
+        operator_calls=tuple(calls),
+    )
+
+
+
+def capture_model_runner_artifact(
+    model_runner: object,
+    *,
+    generate_inputs_func: Callable[..., dict[str, Any]],
+    run_context: ModelRunContext,
+    producer: ProducerInfo,
+    requests: object | None = None,
+) -> SimulationExecutionArtifact:
+    """Run one capture-only forward without changing ModelRunner or Runtime behavior."""
+
+    model = getattr(model_runner, "model", None)
+    if model is None:
+        raise SourceLoadError("model_runner does not expose model")
+    user_input = getattr(model_runner, "user_input", None)
+    if user_input is None:
+        raise SourceLoadError("model_runner does not expose user_input")
+    selected_requests = getattr(model_runner, "request_info_default", None) if requests is None else requests
+    input_kwargs = generate_inputs_func(
+        model,
+        selected_requests,
+        block_size=user_input.block_size,
+    )
+
+    with (
+        Runtime(
+            getattr(model_runner, "perf_models"),
+            getattr(model_runner, "device_profile"),
+        ) as runtime,
+        torch.no_grad(),
+    ):
+        capture = RuntimeArtifactCapture.begin(runtime, run_context=run_context)
+        model.forward(**input_kwargs)
+
+    # `Runtime.event_list` is populated only inside `Runtime.__exit__` (it calls
+    # repeat_op_invoke_infos()/replay_op_invoke_infos(), which is where events are
+    # first appended), so finish() cannot run inside the `with` block: at that point
+    # event_list is always empty. This is safe because replay reuses the exact same
+    # OpInvokeInfo objects recorded in op_invoke_infos during the forward pass (it
+    # only regroups them; it never copies or reconstructs them), so the id()-based
+    # invocation filtering in _build_runtime_artifact keys off identities that are
+    # stable across replay. See test_replay_preserves_op_invoke_info_identity for a
+    # regression test that pins this invariant.
+    return capture.finish(runtime, producer=producer)
+
+
+def capture_artifact_for_profile(profile: object) -> SimulationExecutionArtifact:
+    """Build ModelRunner from a run profile and capture one Runtime Artifact."""
+
+    from tensor_cast.core.input_generator import generate_inputs
+    from tensor_cast.core.model_runner import ModelRunner
+    from tensor_cast.core.quantization.datatypes import QuantizeLinearAction
+    from tensor_cast.core.user_config import UserInputConfig
+
+    from tools.model_diagnostics.domain import ExecutionPhase
+    from tools.model_diagnostics.specification.run_profile import DiagnosticsRunProfile
+
+    if not isinstance(profile, DiagnosticsRunProfile):
+        raise TypeError("profile must be a DiagnosticsRunProfile")
+    try:
+        quant_action = QuantizeLinearAction(profile.quantize_linear_action)
+    except ValueError as error:
+        raise SourceLoadError(f"unsupported quantize_linear_action {profile.quantize_linear_action!r}") from error
+    parallel = profile.parallel
+    is_moe = _model_is_moe(profile.model_name)
+    if is_moe:
+        _validate_moe_capture_parallel(parallel)
+    user_input = UserInputConfig(
+        device=profile.device,
+        model_id=profile.model_name,
+        num_queries=profile.batch_size,
+        query_len=profile.query_length,
+        context_length=0 if profile.context_length is None else profile.context_length,
+        do_compile=profile.do_compile,
+        enable_mlapo=profile.enable_mlapo,
+        decode=profile.phase is ExecutionPhase.DECODE,
+        num_mtp_tokens=profile.num_mtp_tokens,
+        num_hidden_layers_override=profile.num_hidden_layers_override,
+        world_size=(parallel.tensor_parallel_size * parallel.pipeline_parallel_size * parallel.data_parallel_size),
+        tp_size=parallel.tensor_parallel_size,
+        pp_size=parallel.pipeline_parallel_size,
+        dp_size=parallel.data_parallel_size,
+        ep_size=parallel.expert_parallel_size,
+        # Dense keeps the core-derived default; only a confirmed MoE model uses
+        # diagnostics' fixed MTPt=1 contract.
+        moe_tp_size=1 if is_moe else None,
+        moe_dp_size=parallel.moe_data_parallel_size,
+        quantize_linear_action=quant_action,
+        word_embedding_tp=profile.word_embedding_tp,
+        image_batch_size=profile.image_batch_size,
+        image_height=profile.image_height,
+        image_width=profile.image_width,
+        enable_redundant_experts=profile.enable_redundant_experts,
+        enable_external_shared_experts=profile.enable_external_shared_experts,
+        performance_model=["analytic"],
+    )
+    try:
+        validate_expert_parallel_features(
+            profile.parallel.expert_parallel_size,
+            enable_external_shared_experts=profile.enable_external_shared_experts,
+            enable_redundant_experts=profile.enable_redundant_experts,
+        )
+    except ValueError as error:
+        raise SourceLoadError(str(error)) from error
+    model_runner = ModelRunner(user_input)
+    run_context = _run_context_after_model_load(profile, model_runner)
+    return capture_model_runner_artifact(
+        model_runner,
+        generate_inputs_func=generate_inputs,
+        run_context=run_context,
+        producer=ProducerInfo(
+            package_version="local",
+            git_revision=None,
+            capture_backend=_CAPTURE_BACKEND,
+        ),
+    )
+
+
+def _run_context_after_model_load(profile: object, model_runner: object) -> ModelRunContext:
+    from tools.model_diagnostics.specification.run_profile import DiagnosticsRunProfile
+
+    assert isinstance(profile, DiagnosticsRunProfile)
+    model_config: dict[str, object] = {}
+    model = getattr(model_runner, "model", None)
+    root_config = getattr(model, "hf_config", None)
+    if root_config is None:
+        root_config = getattr(model, "config", None)
+    text_config = getattr(model, "text_config", None)
+    if text_config is None:
+        get_text_config = getattr(root_config, "get_text_config", None)
+        text_config = get_text_config() if callable(get_text_config) else None
+    hf_config = text_config or root_config
+    if hf_config is None:
+        raise SourceLoadError("loaded model does not expose config for ModelRunContext")
+    for key in (
+        "hidden_size",
+        "intermediate_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "num_hidden_layers",
+        "vocab_size",
+        "head_dim",
+        "model_type",
+        # DeepSeek V4 sparse-attention / grouped output-projection fields.
+        "q_lora_rank",
+        "o_lora_rank",
+        "o_groups",
+        "n_shared_experts",
+        "num_hash_layers",
+        "hc_mult",
+        "qk_rope_head_dim",
+        "index_n_heads",
+        "index_head_dim",
+        "topk_limit",
+        "compress_ratios",
+        # MoE (category 2): routed expert count / top-k / MoE FFN width.
+        "num_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "decoder_sparse_step",
+        "mlp_only_layers",
+        "n_routed_experts",
+        "first_k_dense_replace",
+        "kv_lora_rank",
+        "qk_nope_head_dim",
+        "v_head_dim",
+        "index_topk",
+        # Classification-4 hybrid linear attention (Qwen3.5 / Qwen3-Next).
+        "linear_num_key_heads",
+        "linear_num_value_heads",
+        "linear_key_head_dim",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+        "layer_types",
+        "shared_expert_intermediate_size",
+    ):
+        value = getattr(hf_config, key, None)
+        if value is not None:
+            model_config[key] = value
+    model_config["enable_mlapo"] = profile.enable_mlapo
+    root_model_type = getattr(root_config, "model_type", None)
+    # Qwen3-VL, GLM-4V and Kimi-K2.5 Specs intentionally match their multimodal root
+    # types. Other nested configs keep the effective text type copied above;
+    # in particular, Qwen3.5 Specs match ``qwen3_5_text`` /
+    # ``qwen3_5_moe_text`` rather than their multimodal root types.
+    if root_model_type in {"qwen3_vl", "qwen3_vl_moe", "glm4v", "glm4v_moe", "kimi_k25"}:
+        model_config["model_type"] = root_model_type
+    if "index_topk" not in model_config:
+        topk_limit = getattr(hf_config, "topk_limit", None)
+        if topk_limit is not None:
+            model_config["index_topk"] = topk_limit
+    if _is_moe_config(hf_config):
+        # Keep the captured Context consistent with UserInputConfig: these are
+        # diagnostics MoE execution settings, not generic model metadata.
+        model_config["moe_tp_size"] = 1  # MoE TP is fixed at 1 (MTPt>1 unsupported).
+        model_config["moe_dp_size"] = profile.parallel.moe_data_parallel_size
+        model_config["enable_redundant_experts"] = profile.enable_redundant_experts
+        model_config["enable_external_shared_experts"] = profile.enable_external_shared_experts
+    vision_config = getattr(root_config, "vision_config", None)
+    vision_merge_size = None
+    if vision_config is not None:
+        for source_keys, target_key in (
+            (("hidden_size", "vt_hidden_size"), "vision_hidden_size"),
+            (("intermediate_size", "vt_intermediate_size"), "vision_intermediate_size"),
+            (("depth", "num_hidden_layers", "vt_num_hidden_layers"), "vision_num_hidden_layers"),
+            (("patch_size",), "vision_patch_size"),
+            (("temporal_patch_size",), "vision_temporal_patch_size"),
+            (("in_channels",), "vision_in_channels"),
+            (("out_hidden_size", "text_hidden_size"), "vision_out_hidden_size"),
+        ):
+            value = next(
+                (
+                    getattr(vision_config, source_key, None)
+                    for source_key in source_keys
+                    if getattr(vision_config, source_key, None) is not None
+                ),
+                None,
+            )
+            if value is not None:
+                model_config[target_key] = value
+        vision_merge_size = _vision_spatial_merge_size(vision_config)
+        if vision_merge_size is not None:
+            model_config["vision_spatial_merge_size"] = vision_merge_size
+
+        depth = model_config.get("vision_num_hidden_layers")
+        deepstack_indexes = getattr(vision_config, "deepstack_visual_indexes", ())
+        if not isinstance(deepstack_indexes, (list, tuple)):
+            raise SourceLoadError("vision_config.deepstack_visual_indexes must be a list or tuple")
+        if len(deepstack_indexes) != len(set(deepstack_indexes)) or any(
+            isinstance(index, bool) or not isinstance(index, int) or index < 0 for index in deepstack_indexes
+        ):
+            raise SourceLoadError("vision_config.deepstack_visual_indexes must contain unique non-negative integers")
+        if isinstance(depth, int) and any(index >= depth for index in deepstack_indexes):
+            raise SourceLoadError("vision_config.deepstack_visual_indexes contains an out-of-range index")
+        if isinstance(depth, int) and depth > 0:
+            deepstack_set = set(deepstack_indexes)
+            model_config["vision_layer_kinds"] = tuple(
+                "qwen3_vl_deepstack_vision_block" if index in deepstack_set else "qwen3_vl_vision_block"
+                for index in range(depth)
+            )
+
+    for field_name in ("image_batch_size", "image_height", "image_width"):
+        value = getattr(profile, field_name)
+        if value is not None:
+            model_config[field_name] = value
+    if (
+        vision_config is not None
+        and profile.image_batch_size is not None
+        and profile.image_height is not None
+        and profile.image_width is not None
+    ):
+        from tensor_cast.core.input_generator import resize_image
+
+        patch_size = getattr(vision_config, "patch_size", None)
+        merge_size = vision_merge_size or 2
+        temporal_patch_size = getattr(vision_config, "temporal_patch_size", None) or 2
+        if isinstance(patch_size, int) and patch_size > 0:
+            resized_height, resized_width = resize_image(
+                profile.model_name,
+                str(model_config.get("model_type", "")),
+                profile.image_height,
+                profile.image_width,
+                patch_size=patch_size,
+                merge_size=merge_size,
+                temporal_patch_size=temporal_patch_size,
+            )
+            grid_t = 1
+            grid_h = resized_height // patch_size
+            grid_w = resized_width // patch_size
+            image_batch = profile.image_batch_size
+            if root_model_type == "kimi_k25":
+                # MoonViT patch/projector tensors are flattened across every
+                # request assigned to this rank, so their totals are rank-local.
+                local_batch = (
+                    profile.batch_size + profile.parallel.data_parallel_size - 1
+                ) // profile.parallel.data_parallel_size
+                image_batch *= local_batch
+            patch_tokens = image_batch * grid_t * grid_h * grid_w
+            model_config.update(
+                {
+                    "image_resized_height": resized_height,
+                    "image_resized_width": resized_width,
+                    "vision_grid_t": grid_t,
+                    "vision_grid_h": grid_h,
+                    "vision_grid_w": grid_w,
+                    "vision_patch_tokens": patch_tokens,
+                    "vision_projector_tokens": patch_tokens // (merge_size**2),
+                    # Text tokens remain per request: build_theory_env adds them
+                    # to Q before multiplying the resulting sequence by local_batch.
+                    "vision_text_tokens": profile.image_batch_size
+                    * (grid_t * grid_h * grid_w // (merge_size**2) + VISION_IMAGE_BOUNDARY_TOKEN_COUNT),
+                }
+            )
+    declared_dtype = next(_config_dtypes((root_config, text_config)), None)
+    runtime_model_config = getattr(model, "model_config", None)
+    runtime_dtype = getattr(runtime_model_config, "dtype", None)
+    runtime_dtype_name = _normalize_dtype(runtime_dtype) if runtime_dtype is not None else None
+    if declared_dtype is not None:
+        model_config["declared_torch_dtype"] = declared_dtype
+    if runtime_dtype_name is not None:
+        # Theory must use the dtype that produced the captured Runtime tensors.
+        # Keep the HF declaration separately for diagnostics and auditability.
+        model_config["torch_dtype"] = runtime_dtype_name
+    elif declared_dtype is not None:
+        # Lightweight test doubles and legacy callers may not expose the
+        # resolved ModelConfig; in that case the declaration is the best
+        # available runtime dtype evidence.
+        model_config["torch_dtype"] = declared_dtype
+    features: list[str] = []
+    if profile.do_compile:
+        features.append("compiled")
+    if features:
+        model_config["features"] = features
+    if profile.word_embedding_tp is not None:
+        model_config["word_embedding_tp"] = profile.word_embedding_tp
+    if profile.num_hidden_layers_override > 0:
+        model_config["effective_num_hidden_layers"] = profile.num_hidden_layers_override
+    else:
+        layers = model_config.get("num_hidden_layers")
+        if isinstance(layers, int) and layers > 0:
+            model_config["effective_num_hidden_layers"] = layers
+    # Hybrid layer_types describe the full model; trim them to the executed
+    # layer count so the sequence layout rule matches the captured slice.
+    layer_types = model_config.get("layer_types")
+    effective = model_config.get("effective_num_hidden_layers")
+    if isinstance(layer_types, list) and isinstance(effective, int) and len(layer_types) > effective:
+        model_config["layer_types"] = layer_types[:effective]
+    if root_model_type == "qwen3_vl_moe" and _is_moe_config(hf_config) and isinstance(effective, int):
+        model_config["language_layer_kinds"] = qwen3_vl_moe_layer_kinds(
+            model_config,
+            start=0,
+            count=effective,
+        )
+    user_input = getattr(model_runner, "user_input", None)
+    num_mtp_tokens = getattr(user_input, "num_mtp_tokens", None)
+    if isinstance(num_mtp_tokens, int) and not isinstance(num_mtp_tokens, bool) and num_mtp_tokens >= 0:
+        model_config["num_mtp_tokens"] = num_mtp_tokens
+        if root_model_type == "qwen3_vl_moe" and _is_moe_config(hf_config) and isinstance(effective, int):
+            model_config["mtp_layer_kinds"] = tuple(
+                kind.replace("_text_decoder", "_mtp")
+                for kind in qwen3_vl_moe_layer_kinds(
+                    model_config,
+                    start=effective,
+                    count=num_mtp_tokens,
+                )
+            )
+    block_size = getattr(user_input, "block_size", None)
+    if isinstance(block_size, int) and block_size > 0:
+        model_config["block_size"] = block_size
+    quantization_config: dict[str, object] = {
+        "enabled": profile.quantize_linear_action != "DISABLED",
+        "action": profile.quantize_linear_action,
+    }
+    if profile.quantize_linear_action in {
+        "W8A8_DYNAMIC",
+        "W8A8_STATIC",
+        "W4A8_DYNAMIC",
+        "W4A8_STATIC",
+    }:
+        quantization_config["linear_input_dtype"] = "int8"
+    return ModelRunContext(
+        model_name=profile.model_name,
+        entrypoint=profile.entrypoint,
+        phase=profile.phase,
+        batch_size=profile.batch_size,
+        query_length=profile.query_length,
+        context_length=profile.context_length,
+        parallel=profile.parallel,
+        model_config=model_config,
+        quantization_config=quantization_config,
+    )

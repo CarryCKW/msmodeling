@@ -1,0 +1,84 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Shared product source roots for coverage, test_map, and testguard."""
+
+from __future__ import annotations
+
+import contextlib
+import os
+import sqlite3
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+from scripts.helpers._paths import REPO_ROOT
+from scripts.helpers.ci_gate.gate_policy import load_gate_policy
+from scripts.helpers.common.pytest_runner import xdist_worker_args
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+
+_COVERAGE_SCHEMA_TABLES = frozenset({"coverage_schema", "meta", "file", "context", "line_bits", "arc", "tracer"})
+
+
+def corrupt_coverage_files(paths: Sequence[Path]) -> tuple[Path, ...]:
+    """Return coverage SQLite files that are unreadable or missing required tables."""
+    damaged: list[Path] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+                rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+                tables = {str(row[0]) for row in rows}
+        except sqlite3.Error:
+            damaged.append(path)
+            continue
+        if not _COVERAGE_SCHEMA_TABLES.issubset(tables):
+            damaged.append(path)
+    return tuple(damaged)
+
+
+def product_roots(repo_root: Path | None = None) -> tuple[str, ...]:
+    """Product source path prefixes from tests/.ci/gate_policy.yaml ``roots``."""
+    return load_gate_policy(repo_root or REPO_ROOT).roots
+
+
+def pytest_xdist_args(*, collected_count: int | None = None) -> list[str]:
+    """pytest-xdist parallelism; safe with pytest-cov when ``[tool.coverage.run] parallel`` is set.
+
+    When *collected_count* is omitted, worker count defaults to ``os.cpu_count()`` (legacy callers).
+    """
+    if collected_count is None:
+        collected_count = os.cpu_count() or 1
+    return xdist_worker_args(collected_count)
+
+
+def cov_pytest_args(*, cov_context: bool = False, append: bool = False) -> list[str]:
+    """Build --cov flags for pytest. Always uses --cov-branch, no terminal report.
+
+    Requires ``parallel = true`` under ``[tool.coverage.run]`` when used with ``pytest_xdist_args()``.
+    """
+    cov_packages = tuple(p.rstrip("/") for p in product_roots())
+    args: list[str] = [f"--cov={pkg}" for pkg in cov_packages]
+    args.append("--cov-branch")
+    if cov_context:
+        args.append("--cov-context=test")
+    if append:
+        args.append("--cov-append")
+    args.append("--cov-report=")
+    return args

@@ -1,0 +1,793 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Build constrained Theory evaluation environments from ModelRunContext."""
+
+from __future__ import annotations
+
+import math
+from statistics import NormalDist
+from typing import Mapping
+
+from tools.model_diagnostics.domain.models import (
+    ExecutionPhase,
+    ModelRunContext,
+    validate_expert_parallel_features,
+)
+from tools.model_diagnostics.domain.constants import VISION_IMAGE_BOUNDARY_TOKEN_COUNT
+from tools.model_diagnostics.specification.errors import SpecificationLoadError
+from tools.model_diagnostics.specification.mtp_window import (
+    parse_num_mtp_tokens,
+    validate_mtp_decode_window,
+)
+
+
+def _require_positive(context: ModelRunContext, field_name: str) -> int:
+    value = getattr(context, field_name)
+    if value is None:
+        raise SpecificationLoadError(f"ModelRunContext.{field_name} is required for Theory evaluation")
+    return value
+
+
+def _config_int(config: Mapping[str, object], key: str) -> int:
+    value = config.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SpecificationLoadError(f"model_config.{key} must be a positive integer")
+    return value
+
+
+def _routed_expert_count(config: Mapping[str, object]) -> int:
+    """Return the routed expert count used by Qwen or DeepSeek configs."""
+    if "n_routed_experts" in config:
+        return _config_int(config, "n_routed_experts")
+    if "num_experts" in config:
+        return _config_int(config, "num_experts")
+    raise SpecificationLoadError("model_config requires num_experts or n_routed_experts")
+
+
+def _optional_config_int(config: Mapping[str, object], key: str, *, default: int) -> int:
+    value = config.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SpecificationLoadError(f"model_config.{key} must be an integer")
+    if value <= 0:
+        raise SpecificationLoadError(f"model_config.{key} must be positive")
+    return value
+
+
+def _dtype_binding(
+    config: Mapping[str, object],
+    key: str,
+    *,
+    default: str,
+) -> str:
+    value = config.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise SpecificationLoadError(f"quantization_config.{key} must be a non-empty string")
+    return value
+
+
+def _moe_combine_dtype(config: Mapping[str, object], activation_dtype: str) -> str | None:
+    """Resolve the routed-expert weighted-reduction dtype from model semantics."""
+
+    model_type = config.get("model_type")
+    if model_type == "deepseek_v32":
+        return "float32"
+    if model_type in {"deepseek_v3", "glm_moe_dsa", "kimi_k2"}:
+        return activation_dtype
+    return None
+
+
+def _assign_experts(num_experts: int, world_size: int, rank: int) -> tuple[int, int]:
+    """Mirror ``tensor_cast.layers.moe_layer.assign_experts`` (no tensor_cast import)."""
+
+    if world_size <= 0:
+        raise SpecificationLoadError("expert parallel device count must be positive")
+    if rank < 0 or rank >= world_size:
+        raise SpecificationLoadError("MoE expert-assignment rank must be in [0, device_count)")
+    num_experts_per_device = num_experts // world_size
+    num_experts_rest = num_experts % world_size
+    if rank < num_experts_rest:
+        start = rank * (num_experts_per_device + 1)
+        num_local_experts = num_experts_per_device + 1
+    else:
+        start = num_experts_rest * (num_experts_per_device + 1) + (rank - num_experts_rest) * num_experts_per_device
+        num_local_experts = num_experts_per_device
+    return start, num_local_experts
+
+
+def _optional_config_bool(config: Mapping[str, object], key: str, *, default: bool = False) -> bool:
+    value = config.get(key, default)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise SpecificationLoadError(f"model_config.{key} must be a boolean")
+    return value
+
+
+def _derive_ep_expert_counts(
+    *,
+    ep: int,
+    top_k: int,
+    num_routing_experts: int,
+    enable_external_shared_experts: bool,
+    enable_redundant_experts: bool,
+) -> tuple[int, int]:
+    """Mirror ``shard_model_by_ep`` external/redundant counts (no tensor_cast import)."""
+
+    try:
+        validate_expert_parallel_features(
+            ep,
+            enable_external_shared_experts=enable_external_shared_experts,
+            enable_redundant_experts=enable_redundant_experts,
+        )
+    except ValueError as error:
+        raise SpecificationLoadError(str(error)) from error
+    if ep <= 1:
+        return 0, 0
+
+    if enable_external_shared_experts:
+        if top_k + 1 > ep:
+            external = 1
+        else:
+            external = math.ceil(ep / (top_k + 1))
+    else:
+        external = 0
+
+    if external >= ep:
+        raise SpecificationLoadError("num_external_shared_experts must be smaller than expert_parallel_size")
+
+    if enable_external_shared_experts:
+        routing_devices = ep - external
+        redundant = routing_devices - (num_routing_experts % routing_devices)
+        if not enable_redundant_experts and redundant == routing_devices:
+            redundant = 0
+    elif enable_redundant_experts:
+        redundant = ep
+    else:
+        redundant = 0
+
+    if redundant < 0:
+        raise SpecificationLoadError("derived redundant expert count must be non-negative")
+    return external, redundant
+
+
+def _validate_ep_token_args(
+    *,
+    routed_tokens: int,
+    top_k: int,
+    num_global_experts: int,
+    ep: int,
+    ep_rank: int,
+    num_external_shared_experts: int = 0,
+) -> None:
+    """Validate the integer-domain inputs used by analytic EP token dispatch."""
+
+    if routed_tokens <= 0:
+        raise SpecificationLoadError("routed token count (T*Ktop) must be positive")
+    if top_k <= 0:
+        raise SpecificationLoadError("num_experts_per_tok must be positive")
+    if num_global_experts <= 0:
+        raise SpecificationLoadError("global expert count must be positive")
+    if isinstance(num_external_shared_experts, bool) or not isinstance(num_external_shared_experts, int):
+        raise SpecificationLoadError("external shared expert count must be an integer")
+    if num_external_shared_experts < 0:
+        raise SpecificationLoadError("external shared expert count must be non-negative")
+    if num_external_shared_experts >= ep:
+        raise SpecificationLoadError("external shared expert count must be smaller than expert_parallel_size")
+    if ep_rank < 0 or ep_rank >= ep:
+        raise SpecificationLoadError("analytic EP rank must be in [0, EP)")
+
+
+_SOFT_SPLIT_MIN_EXPERTS_PER_RANK = 4
+
+
+def _balanced_split(total: int, parts: int) -> list[int]:
+    """Distribute ``total`` over ``parts`` with at most one item of skew."""
+    base = total // parts
+    remainder = total - base * parts
+    return [base + int(index < remainder) for index in range(parts)]
+
+
+def _expected_max_load(total: int, parts: int) -> int:
+    """Independent equivalent of TensorCast's finite-sample hotspot estimate."""
+    if total == 0 or parts == 1:
+        return total
+    mean_load = total / parts
+    variance = mean_load * (1 - 1 / parts)
+    quantile = (parts - 0.375) / (parts + 0.25)
+    return min(total, math.ceil(mean_load + NormalDist().inv_cdf(quantile) * math.sqrt(variance)))
+
+
+def _soft_critical_load(
+    total: int,
+    parts: int,
+    num_global_experts: int,
+    num_local_experts: int,
+) -> int:
+    """Mirror the soft capacity split without importing TensorCast internals."""
+    balanced_load = (total + parts - 1) // parts
+    if num_global_experts < _SOFT_SPLIT_MIN_EXPERTS_PER_RANK * parts:
+        return balanced_load
+
+    expected_max_load = _expected_max_load(total, parts)
+    capacity_load = min(total, math.ceil(total / num_global_experts) * num_local_experts)
+    capacity_weighted_load = math.ceil((expected_max_load + 2 * capacity_load) / 3)
+    return min(total, max(expected_max_load, capacity_weighted_load))
+
+
+def _simulated_ep_local_token_count(
+    *,
+    routed_tokens: int,
+    top_k: int,
+    num_global_experts: int,
+    ep: int,
+    ep_rank: int,
+    num_external_shared_experts: int = 0,
+) -> int:
+    """EP-local Te under tensor_cast analytic MoE dispatch assumptions.
+
+    Mirrors ``FusedMoETensorCast.get_split_sizes`` including optional external
+    shared-expert ranks and redundant experts in ``num_global_experts``. The
+    first routing rank uses the soft critical-rank load; remaining pairs are
+    balanced over the other routing ranks. Te is this rank's input split times
+    EP because each peer is assumed to send the same share.
+    """
+
+    _validate_ep_token_args(
+        routed_tokens=routed_tokens,
+        top_k=top_k,
+        num_global_experts=num_global_experts,
+        ep=ep,
+        ep_rank=ep_rank,
+        num_external_shared_experts=num_external_shared_experts,
+    )
+
+    input_split_sizes_by_device: list[int] = []
+    if num_external_shared_experts > 0:
+        tokens_per_external = routed_tokens // top_k // num_external_shared_experts
+        external_rest = routed_tokens // top_k % num_external_shared_experts
+        for rank in range(num_external_shared_experts):
+            input_split_sizes_by_device.append(tokens_per_external + (1 if rank < external_rest else 0))
+
+    routing_devices = ep - num_external_shared_experts
+    expert_assignments = [_assign_experts(num_global_experts, routing_devices, rank) for rank in range(routing_devices)]
+    routing_ranks_with_experts = [
+        rank for rank, (_, num_local_experts) in enumerate(expert_assignments) if num_local_experts > 0
+    ]
+    routed_tokens_by_rank = [0] * routing_devices
+    if routing_ranks_with_experts:
+        critical_rank = routing_ranks_with_experts[0]
+        routed_tokens_by_rank[critical_rank] = _soft_critical_load(
+            routed_tokens,
+            len(routing_ranks_with_experts),
+            num_global_experts,
+            expert_assignments[critical_rank][1],
+        )
+        remaining_ranks = routing_ranks_with_experts[1:]
+        remaining_tokens = routed_tokens - routed_tokens_by_rank[critical_rank]
+        for rank, rank_tokens in zip(remaining_ranks, _balanced_split(remaining_tokens, len(remaining_ranks))):
+            routed_tokens_by_rank[rank] = rank_tokens
+
+    input_split_sizes_by_device.extend(routed_tokens_by_rank)
+
+    return input_split_sizes_by_device[ep_rank] * ep
+
+
+def _moe_input_token_count(*, tokens: int, tp: int, dp: int, ep: int) -> int:
+    """Mirror ``ParallelMoELayer._dp_transform_enter`` token-domain conversion."""
+
+    has_ep = ep > 1
+    transform_dp_group = dp != ep if has_ep else dp != 1
+    if not transform_dp_group:
+        return tokens
+    if has_ep:
+        return math.ceil(tokens / tp)
+    return tokens * dp
+
+
+def build_theory_env(context: ModelRunContext) -> dict[str, object]:
+    """Derive B/Q/S/T/H/TP and related bindings for shape/dtype expressions."""
+
+    batch = _require_positive(context, "batch_size")
+    query = _require_positive(context, "query_length")
+    context_length = context.context_length if context.context_length is not None else 0
+    if isinstance(context_length, bool) or not isinstance(context_length, int) or context_length < 0:
+        raise SpecificationLoadError("context_length must be a non-negative integer")
+
+    config = context.model_config
+    hidden = _config_int(config, "hidden_size")
+    vocab = _config_int(config, "vocab_size")
+    if "intermediate_size" in config:
+        intermediate = _config_int(config, "intermediate_size")
+    elif "moe_intermediate_size" in config:
+        # Pure-MoE models (e.g. Qwen3.5 MoE) expose no dense FFN width.
+        intermediate = _config_int(config, "moe_intermediate_size")
+    else:
+        raise SpecificationLoadError("model_config.intermediate_size must be a positive integer")
+    num_heads = _config_int(config, "num_attention_heads")
+    num_kv_heads = _config_int(config, "num_key_value_heads")
+    head_dim = config.get("head_dim")
+    if head_dim is None:
+        if hidden % num_heads != 0:
+            raise SpecificationLoadError("hidden_size must be divisible by num_attention_heads")
+        head_dim = hidden // num_heads
+    elif isinstance(head_dim, bool) or not isinstance(head_dim, int) or head_dim <= 0:
+        raise SpecificationLoadError("model_config.head_dim must be a positive integer")
+    # Qwen3.5/Qwen3-Next full-attention layers double the query head dim
+    # (nope + rope halves) while K/V keep head_dim; other families use 1x.
+    model_type = config.get("model_type")
+    q_head_dim = head_dim * 2 if model_type in {"qwen3_5_text", "qwen3_5_moe_text", "qwen3_next"} else head_dim
+
+    tp = context.parallel.tensor_parallel_size
+    dp = context.parallel.data_parallel_size
+    ep = context.parallel.expert_parallel_size
+    mdp = context.parallel.moe_data_parallel_size
+    mlp_tp = _optional_config_int(config, "mlp_tp_size", default=tp)
+    o_proj_tp = _optional_config_int(config, "o_proj_tp_size", default=tp)
+    # ParallelConfig defaults lm-head TP to the model tensor-parallel degree.
+    lmhead_tp = _optional_config_int(config, "lmhead_tp_size", default=tp)
+
+    dtype = config.get("torch_dtype") or config.get("dtype") or "float16"
+    if not isinstance(dtype, str) or not dtype.strip():
+        raise SpecificationLoadError("model dtype must be a non-empty string")
+    quantization = context.quantization_config
+    activation_dtype = _dtype_binding(
+        quantization,
+        "activation_dtype",
+        default=dtype,
+    )
+    linear_input_dtype = _dtype_binding(
+        quantization,
+        "linear_input_dtype",
+        default=activation_dtype,
+    )
+    dsa_preparation_input_dtype = "bfloat16" if model_type == "glm_moe_dsa" else linear_input_dtype
+    weight_dtype = _dtype_binding(
+        quantization,
+        "weight_dtype",
+        default=dtype,
+    )
+    scale_dtype = _dtype_binding(
+        quantization,
+        "scale_dtype",
+        default="float32",
+    )
+    accumulation_dtype = _dtype_binding(
+        quantization,
+        "accumulation_dtype",
+        default=dtype,
+    )
+    output_dtype = _dtype_binding(
+        quantization,
+        "output_dtype",
+        default=activation_dtype,
+    )
+
+    # Local rank batch after DP split, matching the alignment table B=ceil(num_queries/DP).
+    local_batch = int(math.ceil(batch / dp))
+    seq = context_length + query
+    tokens = local_batch * query
+    local_heads = num_heads // tp
+    if num_heads % tp != 0:
+        raise SpecificationLoadError("num_attention_heads must be divisible by TP")
+    local_kv = max(num_kv_heads // tp, 1)
+    ftp = intermediate // mlp_tp
+    if intermediate % mlp_tp != 0:
+        raise SpecificationLoadError("intermediate_size must be divisible by MLP_TP")
+    vtp = vocab // lmhead_tp
+    if vocab % lmhead_tp != 0:
+        raise SpecificationLoadError("vocab_size must be divisible by lmhead_tp_size")
+
+    embedding_tp_mode = config.get("word_embedding_tp")
+    if embedding_tp_mode not in {None, "col", "row"}:
+        raise SpecificationLoadError("model_config.word_embedding_tp must be 'col', 'row', or null")
+    embedding_vocab = int(math.ceil(vocab / tp)) if embedding_tp_mode == "row" else vocab
+    embedding_hidden = int(math.ceil(hidden / tp)) if embedding_tp_mode == "col" else hidden
+    embedding_output_hidden = embedding_hidden if embedding_tp_mode == "col" else hidden
+
+    vision_env: dict[str, object] = {}
+    if "vision_hidden_size" in config:
+        vision_hidden = _config_int(config, "vision_hidden_size")
+        vision_intermediate = _config_int(config, "vision_intermediate_size")
+        vision_patch = _config_int(config, "vision_patch_size")
+        vision_merge = _config_int(config, "vision_spatial_merge_size")
+        vision_temporal = _config_int(config, "vision_temporal_patch_size")
+        vision_channels = _config_int(config, "vision_in_channels")
+        vision_out_hidden = _config_int(config, "vision_out_hidden_size")
+        image_values = tuple(config.get(key, 0) for key in ("image_batch_size", "image_height", "image_width"))
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in image_values):
+            raise SpecificationLoadError("image_batch_size/image_height/image_width must be non-negative integers")
+        image_batch, image_height, image_width = image_values
+        grid_t = 1
+        grid_h = grid_w = 0
+        patch_tokens = projector_tokens = text_tokens = 0
+        if image_batch and image_height and image_width:
+            token_keys = (
+                "vision_patch_tokens",
+                "vision_projector_tokens",
+                "vision_text_tokens",
+            )
+            if all(key in config for key in token_keys):
+                patch_tokens = _config_int(config, "vision_patch_tokens")
+                projector_tokens = _config_int(config, "vision_projector_tokens")
+                text_tokens = _config_int(config, "vision_text_tokens")
+                # MoonViT's spatial unshuffle Theory uses the concrete grid.
+                # Other multimodal specs consume only the materialized token
+                # counts and must retain the upstream master behaviour, which
+                # does not require grid fields in hand-built contexts.
+                if config.get("model_type") == "kimi_k25":
+                    grid_t = _config_int(config, "vision_grid_t")
+                    grid_h = _config_int(config, "vision_grid_h")
+                    grid_w = _config_int(config, "vision_grid_w")
+            else:
+                resized_height = config.get("image_resized_height")
+                resized_width = config.get("image_resized_width")
+                if not (
+                    isinstance(resized_height, int)
+                    and not isinstance(resized_height, bool)
+                    and resized_height > 0
+                    and isinstance(resized_width, int)
+                    and not isinstance(resized_width, bool)
+                    and resized_width > 0
+                ):
+                    missing_tokens = tuple(key for key in token_keys if key not in config)
+                    raise SpecificationLoadError(
+                        "visual geometry must be materialized by Runtime capture; "
+                        "provide positive image_resized_height/image_resized_width or all token counts; "
+                        f"missing {', '.join(missing_tokens)}"
+                    )
+                grid_t = _optional_config_int(config, "vision_grid_t", default=1)
+                grid_h = _optional_config_int(
+                    config,
+                    "vision_grid_h",
+                    default=resized_height // vision_patch,
+                )
+                grid_w = _optional_config_int(
+                    config,
+                    "vision_grid_w",
+                    default=resized_width // vision_patch,
+                )
+                default_patch_tokens = image_batch * grid_t * grid_h * grid_w
+                if config.get("model_type") == "kimi_k25":
+                    # MoonViT flattens every image assigned to this rank before
+                    # patch embedding, so its patch/projector totals are rank-local.
+                    default_patch_tokens *= local_batch
+                patch_tokens = _optional_config_int(
+                    config,
+                    "vision_patch_tokens",
+                    default=default_patch_tokens,
+                )
+                projector_tokens = _optional_config_int(
+                    config,
+                    "vision_projector_tokens",
+                    default=patch_tokens // (vision_merge**2),
+                )
+                text_tokens = _optional_config_int(
+                    config,
+                    "vision_text_tokens",
+                    default=image_batch
+                    * (grid_t * grid_h * grid_w // (vision_merge**2) + VISION_IMAGE_BOUNDARY_TOKEN_COUNT),
+                )
+        vision_env = {
+            "Vp": vision_patch,
+            "Vm": vision_merge,
+            "Vt": vision_temporal,
+            "Vc": vision_channels,
+            "VTok": patch_tokens,
+            "VProjTok": projector_tokens,
+            "VH": vision_hidden,
+            "VF": vision_intermediate,
+            "VMH": vision_hidden * (vision_merge**2),
+            "VOH": vision_out_hidden,
+        }
+        if config.get("model_type") == "kimi_k25":
+            local_image_batch = local_batch * image_batch
+            vision_env.update(
+                {
+                    "ViB": local_image_batch,
+                    "VgT": grid_t,
+                    "VgH": grid_h,
+                    "VgW": grid_w,
+                    "VProjImg": grid_h * grid_w // (vision_merge**2),
+                    "VIn": vision_channels * vision_temporal * vision_patch * vision_patch,
+                }
+            )
+        if text_tokens:
+            if context.phase is ExecutionPhase.PREFILL:
+                query += text_tokens
+                seq = context_length + query
+                tokens = local_batch * query
+            elif context.phase is ExecutionPhase.DECODE:
+                seq = context_length + query + text_tokens
+
+    validate_mtp_decode_window(context)
+    mtp = parse_num_mtp_tokens(context)
+    rtgt = local_batch * (mtp + 1)
+    rprop = local_batch
+    if context.phase is ExecutionPhase.PREFILL:
+        rout = local_batch
+    elif context.phase is ExecutionPhase.DECODE:
+        rout = tokens
+    else:
+        rout = local_batch
+
+    # Paged-attention pool sizing mirrors tensor_cast.core.input_generator.generate_inputs.
+    block_size = _optional_config_int(config, "block_size", default=128)
+    max_context_length = seq + mtp + 1
+    num_blocks = (max_context_length * local_batch + block_size - 1) // block_size
+    max_blocks_per_seq = (seq + block_size - 1) // block_size
+
+    v4_env: dict[str, object] = {}
+    if config.get("model_type") == "deepseek_v4":
+        o_lora_rank = _config_int(config, "o_lora_rank")
+        o_groups = _config_int(config, "o_groups")
+        if o_proj_tp > o_groups:
+            raise SpecificationLoadError("o_proj_tp_size must not exceed o_groups")
+        if o_groups % o_proj_tp != 0:
+            raise SpecificationLoadError("o_groups must be divisible by o_proj_tp_size")
+        o_group_local = o_groups // o_proj_tp
+        hc_mult = _config_int(config, "hc_mult")
+        index_head_dim = _config_int(config, "index_head_dim")
+        index_topk = _config_int(config, "index_topk")
+        indexer_blocks = (max_context_length * local_batch + block_size * 4 - 1) // (block_size * 4)
+
+        def _compressed_query_tokens(ratio: int) -> int:
+            if context.phase is ExecutionPhase.DECODE and context.query_length == 1:
+                return 1
+            return tokens // ratio if tokens >= ratio else 0
+
+        v4_env = {
+            "Qr": _config_int(config, "q_lora_rank"),
+            "Og": o_groups,
+            "Log": o_group_local,
+            "Or": o_group_local * o_lora_rank,
+            "HCm": hc_mult,
+            "HCh": hc_mult * hidden,
+            "IdxDh": index_head_dim,
+            "Kidx": min(index_topk, max(seq // 4, 1)),
+            "Nidxblk": indexer_blocks,
+            "C4Tok": _compressed_query_tokens(4),
+            "C128Tok": _compressed_query_tokens(128),
+        }
+
+    # MoE Theory symbols. Bound only when HF/config exposes MoE fields so Dense
+    # Specs remain unchanged.
+    # E: routed expert count (num_experts / n_routed_experts)
+    # Ktop: experts per token (num_experts_per_tok)
+    # Fmoe: MoE intermediate (moe_intermediate_size); never reuse dense F
+    # MTPt: fixed at 1 (--moe-tp-size > 1 unsupported; Fe = Fmoe).
+    # MDP: --moe-dp-size. It participates in parallel-layout validation, while
+    #     Tmoe mirrors ParallelMoELayer._dp_transform_enter directly:
+    #     EP>1 and DP!=EP -> ceil(T/TP); EP==1 and DP!=1 -> T*DP; otherwise T.
+    # Te: EP-local tokens after dispatch. EP=1 => Tmoe*Ktop. EP>1 => tensor_cast
+    #     get_split_sizes over routed_tokens=Tmoe*Ktop (uniform-over-global-experts,
+    #     optional external shared ranks + redundant experts, symmetric all_to_all;
+    #     not T*Ktop/EP). Counts mirror shard_model_by_ep from enable_* flags.
+    moe_env: dict[str, object] = {}
+    has_routed = "num_experts" in config or "n_routed_experts" in config
+    if has_routed or "num_experts_per_tok" in config or "moe_intermediate_size" in config:
+        experts = _routed_expert_count(config)
+        ktop = _config_int(config, "num_experts_per_tok")
+        # MiniMax-M2 calls the routed expert width ``intermediate_size``.
+        # ``mlp_intermediate_size`` is unrelated model metadata, so keep this
+        # fallback model-specific and fail loudly for every other MoE family.
+        if "moe_intermediate_size" in config:
+            fmoe = _config_int(config, "moe_intermediate_size")
+        elif config.get("model_type") == "minimax_m2":
+            fmoe = _config_int(config, "intermediate_size")
+        else:
+            raise SpecificationLoadError("model_config.moe_intermediate_size must be a positive integer")
+        fe = fmoe  # MTPt is fixed at 1: Fe = Fmoe.
+        tmoe = _moe_input_token_count(tokens=tokens, tp=tp, dp=dp, ep=ep)
+        enable_external = _optional_config_bool(config, "enable_external_shared_experts")
+        enable_redundant = _optional_config_bool(config, "enable_redundant_experts")
+        if ep == 1:
+            _derive_ep_expert_counts(
+                ep=ep,
+                top_k=ktop,
+                num_routing_experts=experts,
+                enable_external_shared_experts=enable_external,
+                enable_redundant_experts=enable_redundant,
+            )
+            te = tmoe * ktop
+            local_experts = experts
+        else:
+            external, redundant = _derive_ep_expert_counts(
+                ep=ep,
+                top_k=ktop,
+                num_routing_experts=experts,
+                enable_external_shared_experts=enable_external,
+                enable_redundant_experts=enable_redundant,
+            )
+            # Analytic Runtime starts at rank 0, or jumps to the first routing
+            # rank when device-side external shared experts occupy lower ranks.
+            ep_rank = external if external > 0 else 0
+            te = _simulated_ep_local_token_count(
+                routed_tokens=tmoe * ktop,
+                top_k=ktop,
+                num_global_experts=experts + redundant,
+                ep=ep,
+                ep_rank=ep_rank,
+                num_external_shared_experts=external,
+            )
+            _local_start, local_experts = _assign_experts(
+                experts + redundant,
+                ep - external,
+                0,
+            )
+        moe_env = {
+            "E": experts,
+            "Elocal": local_experts,
+            # ``Te`` is the dispatched input of one local expert rank after
+            # concatenating the equal contribution from every EP peer.  Empty
+            # ModuleList expert inputs return before their projections execute,
+            # so the per-expert contract must instead count the non-empty
+            # *pre-concatenation* expert buckets on that rank.  Those buckets
+            # sum to ``Te / EP`` and are balanced locally by
+            # FusedMoETensorCast.get_split_sizes.
+            "Eactive": min(local_experts, te // ep),
+            "Ktop": ktop,
+            "Fmoe": fmoe,
+            "MTPt": 1,  # Fixed: --moe-tp-size > 1 is unsupported by this module.
+            "MDP": mdp,
+            "Tmoe": tmoe,
+            "Tshared": tmoe,
+            "Fe": fe,
+            "Te": te,
+        }
+        # MOE_GATE_TOKENS: number of tokens the routed gate observes. Runtime
+        # models with raw-logits gating (DeepSeek V3/V3.1, GLM-5/5.1,
+        # Kimi-K2-Base) run the gate on the full sequence when EP>1 and only
+        # then exchange tokens (ParallelMoELayer._forward_ep_raw_logits); all
+        # other layouts/models gate on the post-transform domain Tmoe. Qwen3.5
+        # MoE also gates on the full sequence under TP>1.
+        model_type = config.get("model_type")
+        if (model_type in {"deepseek_v3", "glm_moe_dsa", "glm4v_moe"} and ep > 1) or (
+            model_type == "qwen3_5_moe_text" and tp > 1
+        ):
+            moe_env["MOE_GATE_TOKENS"] = tokens
+        else:
+            moe_env["MOE_GATE_TOKENS"] = tmoe
+        moe_combine_dtype = _moe_combine_dtype(config, activation_dtype)
+        if moe_combine_dtype is not None:
+            moe_env["MOE_COMBINE_DTYPE"] = moe_combine_dtype
+
+    mla_env: dict[str, object] = {}
+    if "kv_lora_rank" in config:
+        qk_nope = _config_int(config, "qk_nope_head_dim")
+        qk_rope = _config_int(config, "qk_rope_head_dim")
+        # Split MLA cores keep a 0-token placeholder on the unused phase.
+        if context.phase is ExecutionPhase.DECODE:
+            t_prefill, t_decode = 0, tokens
+        else:
+            t_prefill, t_decode = tokens, 0
+        mla_env = {
+            "Qlora": _config_int(config, "q_lora_rank"),
+            "KVlora": _config_int(config, "kv_lora_rank"),
+            "QKnope": qk_nope,
+            "QKrope": qk_rope,
+            "Vh": _config_int(config, "v_head_dim"),
+            "Hmla": qk_nope + qk_rope,
+            "Tprefill": t_prefill,
+            "Tdecode": t_decode,
+        }
+
+    dsa_env: dict[str, object] = {}
+    if "index_topk" in config:
+        dsa_env = {
+            "Dsa_k": min(_config_int(config, "index_topk"), seq),
+            "Dsa_topk": min(_config_int(config, "index_topk"), seq),
+        }
+        # Only expanded GLM DSA projections consume these dimensions. Other
+        # indexer families (including V4) have their own shape contracts.
+        if config.get("model_type") in {"glm_moe_dsa", "deepseek_v32"}:
+            dsa_env.update(
+                Dsa_heads=_config_int(config, "index_n_heads"),
+                Dsa_dim=_config_int(config, "index_head_dim"),
+            )
+
+    # Classification-4 hybrid linear-attention (Qwen3.5/Qwen3-Next): the
+    # linear layer owns its own K/V head counts and head dims, sharded by TP.
+    # Mirror the Runtime constraints: linear_key_head_dim == linear_value_head_dim
+    # and TP divides both linear head counts (see qwen3_5 transformations).
+    linear_env: dict[str, object] = {}
+    if "linear_num_key_heads" in config or "linear_key_head_dim" in config:
+        linear_k_heads = _config_int(config, "linear_num_key_heads")
+        linear_v_heads = _config_int(config, "linear_num_value_heads")
+        linear_k_dim = _config_int(config, "linear_key_head_dim")
+        linear_v_dim = _config_int(config, "linear_value_head_dim")
+        if linear_k_dim != linear_v_dim:
+            raise SpecificationLoadError("linear_key_head_dim must equal linear_value_head_dim")
+        if linear_k_heads % tp != 0 or linear_v_heads % tp != 0:
+            raise SpecificationLoadError(
+                "tensor_parallel_size must divide linear_num_key_heads and linear_num_value_heads"
+            )
+        linear_env = {
+            "Lk_lin": linear_k_heads // tp,
+            "Lv_lin": linear_v_heads // tp,
+            "Klin": linear_k_dim,
+            "Vlin": linear_v_dim,
+        }
+        conv_kernel = config.get("linear_conv_kernel_dim")
+        if conv_kernel is not None:
+            linear_env["LCONV"] = _config_int(config, "linear_conv_kernel_dim")
+
+    shared_env: dict[str, object] = {}
+    n_shared = config.get("n_shared_experts")
+    if n_shared is not None:
+        if isinstance(n_shared, bool) or not isinstance(n_shared, int) or n_shared < 0:
+            raise SpecificationLoadError("model_config.n_shared_experts must be a non-negative integer")
+        if n_shared > 0:
+            shared_env = {
+                "Nshared": n_shared,
+                "Fshared": _config_int(config, "moe_intermediate_size") * n_shared,
+            }
+    elif "shared_expert_intermediate_size" in config:
+        # Single shared-expert FFN width (e.g. Qwen3.5 MoE).
+        shared_env = {"Fshared": _config_int(config, "shared_expert_intermediate_size")}
+
+    return {
+        "B": local_batch,
+        "Q": query,
+        "C": context_length,
+        "S": seq,
+        "T": tokens,
+        "H": hidden,
+        "V": vocab,
+        "F": intermediate,
+        "Nh": num_heads,
+        "Nkv": num_kv_heads,
+        "Dh": head_dim,
+        "QH": q_head_dim,
+        "TP": tp,
+        "DP": dp,
+        "EP": ep,
+        "MLP_TP": mlp_tp,
+        "OTP": o_proj_tp,
+        "LMTP": lmhead_tp,
+        "MTP": mtp,
+        "Rtgt": rtgt,
+        "Rprop": rprop,
+        "Lh": local_heads,
+        "Lkv": local_kv,
+        "Ftp": ftp,
+        "Vtp": vtp,
+        "EV": embedding_vocab,
+        "EH": embedding_hidden,
+        "EO": embedding_output_hidden,
+        "Rout": rout,
+        "Bs": block_size,
+        "Nblk": num_blocks,
+        "Mb": max_blocks_per_seq,
+        "D": dtype,
+        "ACT": activation_dtype,
+        "LINEAR_IN": linear_input_dtype,
+        "DSA_PREP_IN": dsa_preparation_input_dtype,
+        "WEIGHT": weight_dtype,
+        "SCALE": scale_dtype,
+        "ACC": accumulation_dtype,
+        "OUT": output_dtype,
+        "int64": "int64",
+        "float32": "float32",
+        "unknown": None,
+        **moe_env,
+        **mla_env,
+        **dsa_env,
+        **linear_env,
+        **shared_env,
+        **vision_env,
+        **v4_env,
+    }

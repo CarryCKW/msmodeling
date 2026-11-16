@@ -1,0 +1,700 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Offline ``python -m tools.model_diagnostics <run.yaml>`` entry."""
+
+from __future__ import annotations
+
+import io
+import importlib
+import runpy
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from tools.model_diagnostics.builtin import create_stage_comparison_registry
+from tools.model_diagnostics.cli import (
+    _artifact_context_line,
+    _build_parser,
+    _print_user_actionable_warnings,
+    _replay_captured_runtime_output,
+    main,
+)
+from tools.model_diagnostics.domain import ExecutionPhase, ModelRunContext, ParallelContext
+from tools.model_diagnostics.errors import InvalidDiagnosticsRequest
+from tools.model_diagnostics.specification import (
+    SpecificationLoadError,
+    YamlModelDiagnosticsSpecLoader,
+    create_builtin_operator_activation_registry,
+    create_builtin_source_options_parsers,
+    load_diagnostics_run_profile,
+)
+
+
+def test_help_text_is_printable_on_windows_default_console() -> None:
+    _build_parser().format_help().encode("gbk")
+
+
+def test_module_entrypoint_delegates_to_cli(monkeypatch) -> None:
+    monkeypatch.setattr("tools.model_diagnostics.cli.main", lambda: 7)
+
+    with pytest.raises(SystemExit) as error:
+        runpy.run_module("tools.model_diagnostics.__main__", run_name="__main__")
+
+    assert error.value.code == 7
+
+
+def test_builtin_specs_package_is_importable() -> None:
+    package = importlib.reload(importlib.import_module("tools.model_diagnostics.specs"))
+
+    assert package.__all__ == []
+
+
+def test_runtime_context_and_captured_output_helpers(capsys) -> None:
+    context = ModelRunContext(
+        model_name="synthetic/model",
+        entrypoint="test",
+        phase=None,
+        batch_size=2,
+        query_length=3,
+        context_length=None,
+        parallel=ParallelContext(tensor_parallel_size=4),
+        model_config={},
+        quantization_config={},
+    )
+    artifact = type("Artifact", (), {"run_context": context})()
+
+    assert _artifact_context_line(artifact) == ("synthetic/model | ? | batch=2 query=3 context=0 | TP=4")
+    _replay_captured_runtime_output(io.StringIO("runtime out\n"), io.StringIO("runtime err\n"))
+    assert capsys.readouterr().err == "runtime out\nruntime err\n"
+
+
+def test_comparison_report_requires_theory_compare(tmp_path: Path, capsys) -> None:
+    profile = tmp_path / "profile.yaml"
+    profile.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit) as error:
+        main([str(profile), "--comparison-report"])
+    assert error.value.code == 2
+    assert "requires --theory-compare" in capsys.readouterr().err
+
+
+def test_default_runtime_output_keeps_selection_warning(capsys) -> None:
+    captured_stderr = io.StringIO(
+        "profile.py:1: DiagnosticsSelectionWarning: selected language layer 5 is unavailable\n"
+    )
+
+    _print_user_actionable_warnings(io.StringIO(), captured_stderr)
+
+    captured = capsys.readouterr()
+    assert captured.err == ("[model_diagnostics warning] selected language layer 5 is unavailable\n")
+
+
+@pytest.mark.parametrize(
+    ("phase", "query_length", "context_length", "extra_lines"),
+    (
+        (ExecutionPhase.PREFILL, 2, None, ()),
+        (ExecutionPhase.DECODE, 1, 128, ("context_length: 128",)),
+    ),
+)
+def test_load_minimal_run_profile_to_request(
+    tmp_path: Path,
+    phase: ExecutionPhase,
+    query_length: int,
+    context_length: int | None,
+    extra_lines: tuple[str, ...],
+) -> None:
+    # Intentionally does not read tools/model_diagnostics/profiles/* examples;
+    # those files are user-editable samples, not test fixtures.
+    path = tmp_path / f"{phase.value}.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: Qwen/Qwen3-8B",
+                f"phase: {phase.value}",
+                "batch_size: 1",
+                f"query_length: {query_length}",
+                *extra_lines,
+                "num_hidden_layers_override: 1",
+                "quantize_linear_action: W8A8_DYNAMIC",
+            )
+        ),
+        encoding="utf-8",
+    )
+    profile = load_diagnostics_run_profile(path)
+
+    assert profile.model_name == "Qwen/Qwen3-8B"
+    assert profile.entrypoint == "text_generate"
+    assert profile.selected_language_layers is None
+    assert profile.selected_stage_regions == ()
+    assert profile.num_hidden_layers_override == 1
+    assert profile.num_mtp_tokens == 0
+    assert profile.do_compile is True
+    assert profile.quantize_linear_action == "W8A8_DYNAMIC"
+    assert profile.word_embedding_tp is None
+
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(),
+    )
+    context = ModelRunContext(
+        model_name=profile.model_name,
+        entrypoint=profile.entrypoint,
+        phase=profile.phase,
+        batch_size=profile.batch_size,
+        query_length=profile.query_length,
+        context_length=profile.context_length,
+        parallel=profile.parallel,
+        model_config={"model_type": "qwen3", "effective_num_hidden_layers": 1},
+        quantization_config={},
+    )
+    spec = loader.materialize(loader.load("qwen3_dense_v1"), context)
+
+    request = profile.to_request(context=context, spec=spec)
+
+    assert request.context.phase is phase
+    assert request.context.query_length == query_length
+    assert request.context.context_length == context_length
+    assert request.selected_layers == {"language": (0,)}
+    assert request.selected_stage_regions == ("input", "output")
+
+
+def test_run_profile_accepts_mtp_decode(tmp_path: Path) -> None:
+    path = tmp_path / "mtp_decode.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: Qwen/Qwen3-0.6B",
+                "phase: decode",
+                "batch_size: 1",
+                "query_length: 3",
+                "context_length: 128",
+                "num_mtp_tokens: 2",
+                "num_hidden_layers_override: 1",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_diagnostics_run_profile(path)
+
+    assert profile.num_mtp_tokens == 2
+
+
+def test_run_profile_can_explicitly_disable_compile(tmp_path: Path) -> None:
+    path = tmp_path / "eager.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "do_compile: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_diagnostics_run_profile(path).do_compile is False
+
+
+@pytest.mark.parametrize(
+    "image_lines",
+    (
+        ("image_batch_size: 1",),
+        ("image_height: 224", "image_width: 224"),
+        ("image_batch_size: 1", "image_height: 224"),
+    ),
+)
+def test_glm4v_run_profile_rejects_partial_image_dimensions(
+    tmp_path: Path,
+    image_lines: tuple[str, ...],
+) -> None:
+    path = tmp_path / "partial_image.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: zai-org/GLM-4.1V-9B-Thinking",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 30",
+                *image_lines,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match="must be provided together"):
+        load_diagnostics_run_profile(path)
+
+
+def test_glm4v_run_profile_accepts_complete_image_dimensions(tmp_path: Path) -> None:
+    path = tmp_path / "complete_image.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: zai-org/GLM-4.1V-9B-Thinking",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 30",
+                "image_batch_size: 1",
+                "image_height: 224",
+                "image_width: 224",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_diagnostics_run_profile(path)
+
+    assert (profile.image_batch_size, profile.image_height, profile.image_width) == (1, 224, 224)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("schema_version", "false", "schema_version"),
+        ("selected_stage_regions", "output", "must be a sequence"),
+        ("device", "[]", "device must be a non-empty string"),
+        ("entrypoint", '""', "entrypoint must be a non-empty string"),
+        ("entrypoint", "1", "entrypoint must be a non-empty string"),
+        ("quantize_linear_action", "UNKNOWN", "must be one of"),
+        ("quantize_linear_action", '""', "must be one of"),
+    ),
+)
+def test_run_profile_rejects_invalid_scalar_fields(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    path = tmp_path / "invalid_scalar.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                f"{field}: {value}",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match=message):
+        load_diagnostics_run_profile(path)
+
+
+@pytest.mark.parametrize("value", ("true", '"2"', "0"))
+def test_run_profile_rejects_invalid_parallel_degrees(tmp_path: Path, value: str) -> None:
+    path = tmp_path / "invalid_parallel.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "parallel:",
+                f"  tensor_parallel_size: {value}",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match="parallel.tensor_parallel_size"):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_rejects_unknown_parallel_field(tmp_path: Path) -> None:
+    path = tmp_path / "misspelled_parallel.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "parallel:",
+                "  tensor_paralell_size: 8",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match="tensor_paralell_size"):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_rejects_duplicate_yaml_key(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate_parallel.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "parallel:",
+                "  tensor_parallel_size: 2",
+                "  tensor_parallel_size: 4",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match="duplicate key 'tensor_parallel_size'"):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_accepts_zero_context_length(tmp_path: Path) -> None:
+    path = tmp_path / "zero_context.yaml"
+    path.write_text(
+        "\n".join(
+            (
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "context_length: 0",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_diagnostics_run_profile(path).context_length == 0
+
+
+@pytest.mark.parametrize("mode", ("col", "row"))
+def test_run_profile_accepts_word_embedding_tp_modes(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    path = tmp_path / f"embedding_{mode}.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                f"word_embedding_tp: {mode}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_diagnostics_run_profile(path).word_embedding_tp == mode
+
+
+def test_run_profile_accepts_moe_dp_and_expert_flags(tmp_path: Path) -> None:
+    path = tmp_path / "moe_parallel_flags.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-30B-A3B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "parallel:",
+                "  data_parallel_size: 2",
+                "  expert_parallel_size: 2",
+                "  moe_dp_size: 1",
+                "enable_redundant_experts: true",
+                "enable_external_shared_experts: false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_diagnostics_run_profile(path)
+    assert profile.parallel.moe_data_parallel_size == 1
+    assert profile.enable_redundant_experts is True
+    assert profile.enable_external_shared_experts is False
+
+
+def test_run_profile_rejects_moe_tp_field(tmp_path: Path) -> None:
+    """MoE tensor parallel is fixed at 1: any moe_tp_size field must fail fast."""
+
+    path = tmp_path / "reject_moe_tp.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-30B-A3B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "parallel:",
+                "  moe_tp_size: 2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(
+        SpecificationLoadError,
+        match="MoE tensor parallel is fixed at 1 by this module; sizes greater than 1 are unsupported",
+    ):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_rejects_moe_dp_alias_conflict(tmp_path: Path) -> None:
+    """moe_data_parallel_size and moe_dp_size are aliases: both must not be set."""
+
+    path = tmp_path / "reject_moe_dp_alias.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-30B-A3B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "parallel:",
+                "  moe_data_parallel_size: 2",
+                "  moe_dp_size: 1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SpecificationLoadError, match="aliases; provide only one"):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_rejects_unknown_word_embedding_tp_mode(tmp_path: Path) -> None:
+    path = tmp_path / "embedding_invalid.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "word_embedding_tp: diagonal",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match="word_embedding_tp must be one of"):
+        load_diagnostics_run_profile(path)
+
+
+@pytest.mark.parametrize(
+    "image_fields",
+    (
+        ("image_batch_size: 1",),
+        ("image_height: 224",),
+        ("image_width: 224",),
+        ("image_batch_size: 1", "image_height: 224"),
+        ("image_batch_size: 1", "image_width: 224"),
+        ("image_height: 224", "image_width: 224"),
+    ),
+)
+def test_run_profile_rejects_partial_image_dimensions(
+    tmp_path: Path,
+    image_fields: tuple[str, ...],
+) -> None:
+    path = tmp_path / "partial_image_dimensions.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-VL-8B-Instruct",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                *image_fields,
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match="must be provided together"):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_accepts_complete_image_dimensions(tmp_path: Path) -> None:
+    path = tmp_path / "complete_image_dimensions.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-VL-8B-Instruct",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "image_batch_size: 1",
+                "image_height: 224",
+                "image_width: 224",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_diagnostics_run_profile(path)
+
+    assert (profile.image_batch_size, profile.image_height, profile.image_width) == (1, 224, 224)
+
+
+def test_run_profile_selects_only_explicit_language_layers(tmp_path: Path) -> None:
+    path = tmp_path / "selected.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "num_hidden_layers_override: 6",
+                "selected_language_layers: [5, 0, 3]",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    profile = load_diagnostics_run_profile(path)
+    assert profile.selected_language_layers == (0, 3, 5)
+
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(),
+    )
+    context = ModelRunContext(
+        model_name=profile.model_name,
+        entrypoint=profile.entrypoint,
+        phase=profile.phase,
+        batch_size=profile.batch_size,
+        query_length=profile.query_length,
+        context_length=profile.context_length,
+        parallel=profile.parallel,
+        model_config={"model_type": "qwen3", "effective_num_hidden_layers": 6},
+        quantization_config={},
+    )
+    spec = loader.materialize(loader.load("qwen3_dense_v1"), context)
+
+    request = profile.to_request(context=context, spec=spec)
+
+    assert request.selected_layers == {"language": (0, 3, 5)}
+    assert request.selected_stage_regions == ("input", "output")
+
+    with pytest.warns(UserWarning, match="unavailable indices"):
+        skipped = replace(profile, selected_language_layers=(3, 6)).to_request(
+            context=replace(
+                context,
+                model_config={"model_type": "qwen3", "effective_num_hidden_layers": 4},
+            ),
+            spec=loader.materialize(
+                loader.load("qwen3_dense_v1"),
+                replace(
+                    context,
+                    model_config={"model_type": "qwen3", "effective_num_hidden_layers": 4},
+                ),
+            ),
+        )
+    assert skipped.selected_layers == {"language": (3,)}
+
+    narrow_context = replace(
+        context,
+        model_config={"model_type": "qwen3", "effective_num_hidden_layers": 1},
+    )
+    with pytest.raises(InvalidDiagnosticsRequest, match="no indices within captured language layers"):
+        replace(profile, selected_language_layers=(5,)).to_request(
+            context=narrow_context,
+            spec=loader.materialize(loader.load("qwen3_dense_v1"), narrow_context),
+        )
+
+
+@pytest.mark.parametrize(
+    ("selected_language_layers_yaml", "message"),
+    (
+        ("selected_language_layers: []", "non-empty sequence"),
+        ("selected_language_layers: [0, true]", "indices must be integers"),
+        ("selected_language_layers: [-1]", "must be non-negative"),
+    ),
+)
+def test_run_profile_rejects_invalid_selected_language_layers(
+    tmp_path: Path,
+    selected_language_layers_yaml: str,
+    message: str,
+) -> None:
+    path = tmp_path / "bad_selected.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "num_hidden_layers_override: 6",
+                selected_language_layers_yaml,
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SpecificationLoadError, match=message):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_rejects_nested_capture_block(tmp_path: Path) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "num_hidden_layers_override: 1",
+                "capture:",
+                "  model_id: Qwen/Qwen3-8B",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SpecificationLoadError, match="unsupported run-profile field"):
+        load_diagnostics_run_profile(path)
+
+
+def test_run_profile_rejects_user_model_config(tmp_path: Path) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        "\n".join(
+            [
+                "model_name: Qwen/Qwen3-8B",
+                "phase: prefill",
+                "batch_size: 1",
+                "query_length: 2",
+                "num_hidden_layers_override: 1",
+                "model_config:",
+                "  hidden_size: 4096",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SpecificationLoadError, match="unsupported run-profile field"):
+        load_diagnostics_run_profile(path)
+
+
+def test_module_entry_rejects_missing_profile(tmp_path: Path, capsys) -> None:
+    missing = tmp_path / "missing.yaml"
+
+    code = main([str(missing)])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "run profile not found" in captured.err

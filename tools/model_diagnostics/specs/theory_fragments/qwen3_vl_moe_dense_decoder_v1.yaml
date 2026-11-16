@@ -1,0 +1,24 @@
+# Dense fallback layer used when the Qwen3-VL MoE HF decoder selects
+# Qwen3VLMoeTextMLP instead of Qwen3VLMoeTextSparseMoeBlock.
+fragment_id: qwen3_vl_moe_dense_decoder_v1
+fragment_kind: model_decoder
+include_fragments:
+  - qwen3_vl_moe_attention_v1
+stages:
+  - id: dense_ffn
+    modules:
+      - name: gate_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, Ftp]", dtype: OUT}
+      - name: silu
+        tensors:
+          OUTPUT[0]: {shape: "[1, T, Ftp]", dtype: ACT}
+      - name: up_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, Ftp]", dtype: OUT}
+      - name: down_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, H]", dtype: OUT}
+    runtime:
+      boundary_operators: [rms_norm]
+      ignored_operator_groups: [collective_communication, quantization, dtype_cast, layout_permute, shape_views, norm_math_with_add]

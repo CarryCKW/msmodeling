@@ -1,0 +1,1897 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Pipeline-parallel model construction helpers."""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+import json
+import logging
+from typing import Any, Optional
+
+import torch
+
+from . import ops  # noqa: F401
+from .core.user_config import UserInputConfig
+from .device import DeviceProfile
+from .model_config import ModelConfig, ParallelConfig
+from .performance_model.memory_tracker import MemoryTracker
+from .performance_model.utils import bytes_of_tensor
+from .runtime import Runtime
+
+
+class UnsupportedPPConfigurationError(ValueError):
+    """A PP>1 candidate uses a configuration the PP evaluator does not support.
+
+    Raised (not silently ignored) when PP>1 is combined with an unsupported
+    model architecture, variable-length input, or a prefill batch that cannot
+    fit the token budget as a single wave.  Callers in ``parallel_runner``
+    catch ONLY this exception to skip the candidate, so unrelated
+    ``ValueError``s still propagate and fail the run loudly.
+    """
+
+
+def _primary_model_output(output: object) -> object:
+    """Unwrap ``(primary, side...)`` compile-residency returns; see model_runner."""
+    if isinstance(output, (tuple, list)) and output:
+        return output[0]
+    return output
+
+
+@dataclass(frozen=True)
+class PipelineStageSpec:
+    """Global layer range and boundary role for one PP stage."""
+
+    stage_id: int
+    pp_size: int
+    layer_start: int
+    layer_end: int
+    is_first: bool
+    is_last: bool
+    layer_types: tuple[str, ...] = ()
+    extra_tail_layers: int = 0
+    # Draft layers (DFlash/DSpark) on the last stage. Like extra_tail_layers,
+    # extends the KV-cache slice range and input_ids forwarding, but does NOT
+    # affect num_hidden_layers_override (draft layers live inside the wrapper,
+    # not in the HF decoder ModuleList).
+    extra_draft_layers: int = 0
+
+    @property
+    def num_layers(self) -> int:
+        return self.layer_end - self.layer_start
+
+    @property
+    def num_local_layers(self) -> int:
+        return self.num_layers + self.extra_tail_layers
+
+
+@dataclass(frozen=True)
+class PipelinePlan:
+    """Complete PP split plan for a decoder-only model."""
+
+    num_hidden_layers: int
+    stages: tuple[PipelineStageSpec, ...]
+
+
+@dataclass(frozen=True)
+class PipelineStageCacheStats:
+    """KV/indexer cache memory attributed to one stage-local run."""
+
+    kv_cache_bytes: int = 0
+    kv_cache_per_token_bytes: float = 0.0
+    indexer_cache_bytes: int = 0
+    indexer_cache_per_token_bytes: float = 0.0
+
+
+@dataclass(frozen=True)
+class PipelineTransferStats:
+    """Estimated hidden-state transfer cost between two adjacent stages."""
+
+    source_stage_id: int
+    target_stage_id: int
+    payload_bytes: int
+    time_s: float
+    bandwidth_bytes_ps: float
+    latency_s: float
+    time_s_by_model: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PipelineStageProfile:
+    """Structured per-stage profile consumed by the ServingCast scheduler.
+
+    All fields come from a single stage-local run, so the entry is a
+    self-consistent per-rank snapshot. ``runtime_peak_bytes`` and
+    ``outgoing_payload_bytes`` are carried here (not just in the memory
+    breakdown dict) because the Task-4 stage memory formula needs them as
+    first-class typed fields rather than parsed-from-dict values.
+    """
+
+    stage_id: int
+    layer_start: int
+    layer_end: int
+    compute_time_s_by_model: dict[str, float]
+    outgoing_comm_time_s_by_model: dict[str, float]
+    weight_bytes: int
+    activation_bytes: int
+    kv_cache_bytes: int
+    kv_cache_per_token_bytes: float
+    indexer_cache_bytes: int
+    indexer_cache_per_token_bytes: float
+    runtime_peak_bytes: int
+    outgoing_payload_bytes: int
+
+
+@dataclass(frozen=True)
+class PipelineTransferProfile:
+    """Structured per-boundary transfer profile consumed by the scheduler."""
+
+    source_stage_id: int
+    target_stage_id: int
+    payload_bytes: int
+    time_s_by_model: dict[str, float]
+    bandwidth_bytes_ps: float
+    latency_s: float
+
+
+@dataclass(frozen=True)
+class PipelineProfile:
+    """Structured PP profile: partition plus per-stage and per-transfer views.
+
+    Built in ``PipelineRunner._build_run_result`` from the same
+    ``stage_results`` / ``transfers`` used by the existing latency and memory
+    breakdowns, so it never drifts from them. ``None`` for a non-PP run.
+    """
+
+    pp_size: int
+    layer_partition: tuple[int, ...]
+    stages: tuple[PipelineStageProfile, ...]
+    transfers: tuple[PipelineTransferProfile, ...]
+
+
+@dataclass
+class PipelineRunResult:
+    """Aggregated output and profiling data for a full PP forward pass."""
+
+    logits: torch.Tensor
+    execution_time_s: dict[str, float]
+    table_result: str
+    breakdowns: dict[str, dict[str, float]]
+    runtime_event_list: list[dict]
+    peak_memory_usage_bytes: float
+    kv_cache_size_bytes: int
+    kv_cache_per_token_bytes: float
+    indexer_cache_size_bytes: int = 0
+    indexer_cache_per_token_bytes: float = 0.0
+    model_weight_size_bytes: int = 0
+    model_activation_size_bytes: Optional[float] = None
+    stage_latency_breakdown: list[dict] = field(default_factory=list)
+    stage_memory_breakdown: list[dict] = field(default_factory=list)
+    trace_events: list[dict] = field(default_factory=list)
+    pipeline_profile: Optional[PipelineProfile] = None
+
+
+def _exact_division(numerator: int, denominator: int, field_name: str) -> int:
+    if denominator <= 0 or numerator % denominator != 0:
+        raise ValueError(f"Cannot derive {field_name}: {numerator} is not divisible by {denominator}.")
+    return numerator // denominator
+
+
+def _derive_stage_local_rank(
+    parallel_config: ParallelConfig,
+    pp_size: int,
+    stage_id: int,
+) -> int:
+    if parallel_config.rank == -1:
+        return -1
+    if stage_id < 0 or stage_id >= pp_size:
+        raise ValueError(f"stage_id ({stage_id}) must be in [0, {pp_size}).")
+    if parallel_config.rank < 0 or parallel_config.rank >= parallel_config.world_size:
+        raise ValueError(f"rank ({parallel_config.rank}) must be in [0, {parallel_config.world_size}).")
+
+    inner_parallel_size = parallel_config.tensor_parallel_size
+    stage_group_size = pp_size * inner_parallel_size
+    if parallel_config.world_size % stage_group_size != 0:
+        raise ValueError(
+            f"world_size ({parallel_config.world_size}) must be divisible by "
+            f"pipeline_parallel_size ({pp_size}) * inner_parallel_size ({inner_parallel_size})."
+        )
+
+    outer_rank = parallel_config.rank // stage_group_size
+    inner_rank = parallel_config.rank % inner_parallel_size
+    return outer_rank * inner_parallel_size + inner_rank
+
+
+def _stage_boundary_ranks(parallel_config: ParallelConfig, stage_id: int) -> tuple[int, int]:
+    """Return source and target dense ranks for a PP stage boundary."""
+    pp_size = parallel_config.pipeline_parallel_size
+    if stage_id < 0 or stage_id >= pp_size - 1:
+        raise ValueError(f"stage_id {stage_id} is not a valid non-last pipeline stage.")
+    return (
+        _dense_rank_for_pipeline_stage(parallel_config, stage_id),
+        _dense_rank_for_pipeline_stage(parallel_config, stage_id + 1),
+    )
+
+
+def _dense_rank_for_pipeline_stage(parallel_config: ParallelConfig, stage_id: int) -> int:
+    pp_size = parallel_config.pipeline_parallel_size
+    local_world_size = _exact_division(parallel_config.world_size, pp_size, "pipeline_stage_world_size")
+    stage_local_rank = _derive_stage_local_rank(parallel_config, pp_size, stage_id)
+    if stage_local_rank == -1:
+        stage_local_rank = 0
+    if stage_local_rank < 0 or stage_local_rank >= local_world_size:
+        raise ValueError(f"stage-local rank ({stage_local_rank}) must be in [0, {local_world_size}).")
+
+    tensor_parallel_size = parallel_config.tensor_parallel_size
+    data_parallel_size = parallel_config.data_parallel_size
+    ranks_per_outer_group = data_parallel_size * tensor_parallel_size
+    if local_world_size % ranks_per_outer_group != 0:
+        raise ValueError(
+            f"pipeline stage world size ({local_world_size}) must be divisible by "
+            f"data_parallel_size ({data_parallel_size}) * tensor_parallel_size ({tensor_parallel_size})."
+        )
+
+    outer_rank, rank_in_outer_group = divmod(stage_local_rank, ranks_per_outer_group)
+    data_parallel_rank, tensor_parallel_rank = divmod(rank_in_outer_group, tensor_parallel_size)
+    return (
+        (outer_rank * data_parallel_size + data_parallel_rank) * pp_size + stage_id
+    ) * tensor_parallel_size + tensor_parallel_rank
+
+
+_LAYER_METADATA_FIELDS = (
+    "layer_types",
+    "mlp_layer_types",
+    "indexer_types",
+    "compress_ratios",
+    "hybrid_layer_pattern",
+    "moe_layer_freq",
+)
+_EMBEDDING_BOUNDARY_PATHS = (
+    "embed_tokens",
+    "word_embeddings",
+    "model.embed_tokens",
+    "model.word_embeddings",
+    "language_model.embed_tokens",
+    "language_model.word_embeddings",
+    "transformer.wte",
+)
+_FINAL_NORM_BOUNDARY_PATHS = (
+    "norm",
+    "model.norm",
+    "language_model.norm",
+    "transformer.ln_f",
+)
+_LM_HEAD_BOUNDARY_PATHS = ("lm_head", "model.lm_head", "language_model.lm_head")
+
+
+def _dump_input_shapes(user_input: Optional[UserInputConfig]) -> bool:
+    return bool(getattr(user_input, "dump_input_shapes", False))
+
+
+def _dump_op_bound_results(user_input: Optional[UserInputConfig]) -> bool:
+    return bool(getattr(user_input, "dump_op_bound_results", False))
+
+
+class PPMissingLayer(torch.nn.Identity):
+    """Placeholder for modules that are not owned by the current PP stage."""
+
+    def forward(self, *args, **kwargs):
+        """Return the hidden-state-like input owned by the surrounding stage wrapper."""
+        if kwargs.get("inputs_embeds") is not None:
+            return kwargs["inputs_embeds"]
+        if kwargs.get("hidden_states") is not None:
+            return kwargs["hidden_states"]
+        if args and args[0] is not None:
+            return args[0]
+        for value in kwargs.values():
+            if value is not None:
+                return value
+        raise ValueError("PPMissingLayer requires at least one non-None input to pass through.")
+
+
+def build_pipeline_plan(
+    model_config: ModelConfig,
+    pp_size: int,
+    layer_partition: Optional[tuple[int, ...]] = None,
+) -> PipelinePlan:
+    """Build a contiguous decoder-layer split for PP execution."""
+    text_config = model_config.hf_config.get_text_config()
+    num_hidden_layers = model_config.num_hidden_layers_override or text_config.num_hidden_layers
+    if pp_size <= 1:
+        if layer_partition is not None:
+            raise ValueError(
+                f"pp_layer_partition requires pp_size > 1; got pp_size ({pp_size}) "
+                f"for num_hidden_layers ({num_hidden_layers})."
+            )
+        raise ValueError("Pipeline parallel plan requires pp_size > 1.")
+    if num_hidden_layers < pp_size:
+        raise ValueError(f"pipeline_parallel_size ({pp_size}) cannot exceed num_hidden_layers ({num_hidden_layers}).")
+
+    if layer_partition is None:
+        layers_per_partition = num_hidden_layers // pp_size
+        partitions = [layers_per_partition for _ in range(pp_size)]
+        if remaining_layers := num_hidden_layers % pp_size:
+            # Follow vLLM's PP partitioning: avoid placing remainder layers on
+            # the last stage, which usually also owns final norm / lm_head.
+            for offset in range(2, remaining_layers + 2):
+                partitions[-offset] += 1
+        stage_layer_counts = tuple(partitions)
+    else:
+        stage_layer_counts = tuple(layer_partition)
+        if len(stage_layer_counts) != pp_size:
+            raise ValueError(
+                f"pp_layer_partition length ({len(stage_layer_counts)}) must match pp_size ({pp_size}) "
+                f"for num_hidden_layers ({num_hidden_layers})."
+            )
+        if any(stage_layers <= 0 for stage_layers in stage_layer_counts):
+            raise ValueError(
+                f"pp_layer_partition entries must be positive for pp_size ({pp_size}) "
+                f"and num_hidden_layers ({num_hidden_layers}): {stage_layer_counts}."
+            )
+        partition_sum = sum(stage_layer_counts)
+        if partition_sum != num_hidden_layers:
+            raise ValueError(
+                f"pp_layer_partition sum ({partition_sum}) must equal num_hidden_layers ({num_hidden_layers}) "
+                f"for pp_size ({pp_size})."
+            )
+    layer_start = 0
+    stages = []
+    mtp_config = getattr(model_config, "mtp_config", None)
+    mtp_layers = int(getattr(mtp_config, "num_mtp_layers", 0) or 0)
+    draft_layers = int(model_config.draft_num_layers()) if model_config.has_draft_spec() else 0
+    for stage_id, stage_layers in enumerate(stage_layer_counts):
+        layer_end = layer_start + stage_layers
+        layer_types = getattr(text_config, "layer_types", None)
+        is_last = stage_id == pp_size - 1
+        if is_last and draft_layers > stage_layers:
+            # Draft (DFlash/DSpark) aux layers gather from the last stage's
+            # target decoder stack; a plain ValueError deeper in the build
+            # chain would abort the worker instead of skipping the candidate.
+            raise UnsupportedPPConfigurationError(
+                f"last pipeline stage has {stage_layers} target decoder layer(s) "
+                f"but DFlash/DSpark draft needs {draft_layers}; reduce pp_size or "
+                "--num-draft-layers so the last stage fits the draft model"
+            )
+        stages.append(
+            PipelineStageSpec(
+                stage_id=stage_id,
+                pp_size=pp_size,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                is_first=stage_id == 0,
+                is_last=is_last,
+                layer_types=tuple(layer_types[layer_start:layer_end]) if isinstance(layer_types, list) else (),
+                extra_tail_layers=mtp_layers if is_last else 0,
+                extra_draft_layers=draft_layers if is_last else 0,
+            )
+        )
+        layer_start = layer_end
+    return PipelinePlan(num_hidden_layers=num_hidden_layers, stages=tuple(stages))
+
+
+def build_stage_model_config(model_config: ModelConfig, stage_spec: PipelineStageSpec) -> ModelConfig:
+    """Derive a stage-local ModelConfig from the global model config."""
+    stage_config = copy.deepcopy(model_config)
+    text_config = stage_config.hf_config.get_text_config()
+    _rebase_dense_prefix_policy(text_config, stage_spec)
+    _slice_hf_layer_metadata(text_config, stage_spec.layer_start, stage_spec.layer_end)
+    _rebase_attention_quant_config(stage_config.quant_config, stage_spec)
+    stage_config.parallel_config = build_stage_parallel_config(
+        model_config.parallel_config,
+        stage_spec.pp_size,
+        stage_id=stage_spec.stage_id,
+        has_moe=model_config.moe_config is not None,
+    )
+    stage_config.num_hidden_layers_override = stage_spec.num_layers
+    if not stage_spec.is_last:
+        # MTP/DFlash/DSpark proposal layers run after the final decoder stage
+        # and lm_head. Enabling them on earlier PP stages would duplicate
+        # proposal work and rebase draft layer indices against the wrong local
+        # layer stack.
+        stage_config.mtp_config = None
+        stage_config.dflash_config = None
+        stage_config.dspark_config = None
+    return stage_config
+
+
+def apply_stage_boundaries(stage_model: torch.nn.Module, stage_spec: PipelineStageSpec) -> None:
+    """Remove boundary modules not owned by this stage."""
+    boundary_roots = _get_stage_boundary_roots(stage_model)
+    unwrapped_roots = [root for root in boundary_roots if root is not getattr(stage_model, "_inner", None)]
+    if not stage_spec.is_first:
+        _replace_boundary_paths(unwrapped_roots, _EMBEDDING_BOUNDARY_PATHS)
+    if not stage_spec.is_last:
+        _replace_boundary_paths(boundary_roots, _LM_HEAD_BOUNDARY_PATHS)
+        _replace_boundary_paths(unwrapped_roots, _FINAL_NORM_BOUNDARY_PATHS)
+
+
+def build_stage_parallel_config(
+    parallel_config: ParallelConfig,
+    pp_size: int,
+    *,
+    stage_id: int,
+    has_moe: bool = False,
+) -> ParallelConfig:
+    """Drop the PP dimension and recompute stage-local parallel groups."""
+    if parallel_config.world_size % pp_size != 0:
+        raise ValueError(
+            f"world_size ({parallel_config.world_size}) must be divisible by pipeline_parallel_size ({pp_size})."
+        )
+    local_world_size = parallel_config.world_size // pp_size
+    local_rank = _derive_stage_local_rank(parallel_config, pp_size, stage_id)
+
+    if has_moe:
+        expert_parallel_size = parallel_config.expert_parallel_size
+        moe_tensor_parallel_size = parallel_config.moe_tensor_parallel_size
+        moe_data_parallel_size = _exact_division(
+            local_world_size,
+            expert_parallel_size * moe_tensor_parallel_size,
+            "moe_data_parallel_size",
+        )
+    else:
+        expert_parallel_size = 1
+        moe_tensor_parallel_size = 1
+        moe_data_parallel_size = local_world_size
+
+    return ParallelConfig(
+        world_size=local_world_size,
+        rank=local_rank,
+        tensor_parallel_size=parallel_config.tensor_parallel_size,
+        data_parallel_size=_exact_division(
+            local_world_size,
+            parallel_config.tensor_parallel_size,
+            "data_parallel_size",
+        ),
+        pipeline_parallel_size=1,
+        source_pipeline_parallel_size=parallel_config.source_pipeline_parallel_size,
+        o_proj_tensor_parallel_size=parallel_config.o_proj_tensor_parallel_size,
+        o_proj_data_parallel_size=_exact_division(
+            local_world_size,
+            parallel_config.o_proj_tensor_parallel_size,
+            "o_proj_data_parallel_size",
+        ),
+        mlp_tensor_parallel_size=parallel_config.mlp_tensor_parallel_size,
+        mlp_data_parallel_size=_exact_division(
+            local_world_size,
+            parallel_config.mlp_tensor_parallel_size,
+            "mlp_data_parallel_size",
+        ),
+        lmhead_tensor_parallel_size=parallel_config.lmhead_tensor_parallel_size,
+        lmhead_data_parallel_size=_exact_division(
+            local_world_size,
+            parallel_config.lmhead_tensor_parallel_size,
+            "lmhead_data_parallel_size",
+        ),
+        embedding_parallel=parallel_config.embedding_parallel,
+        expert_parallel_size=expert_parallel_size,
+        moe_tensor_parallel_size=moe_tensor_parallel_size,
+        moe_data_parallel_size=moe_data_parallel_size,
+        ulysses_size=parallel_config.ulysses_size,
+    )
+
+
+def _rebase_dense_prefix_policy(text_config, stage_spec: PipelineStageSpec) -> None:
+    original_first_dense_replace = int(getattr(text_config, "first_k_dense_replace", 0) or 0)
+    if hasattr(text_config, "first_k_dense_replace"):
+        stage_first_dense_replace = max(0, original_first_dense_replace - stage_spec.layer_start)
+        text_config.first_k_dense_replace = min(stage_spec.num_layers, stage_first_dense_replace)
+
+    if hasattr(text_config, "num_hash_layers"):
+        original_num_hash_layers = int(getattr(text_config, "num_hash_layers", 0) or 0)
+        hash_start = original_first_dense_replace
+        hash_end = hash_start + original_num_hash_layers
+        stage_hash_layers = max(
+            0,
+            min(stage_spec.layer_end, hash_end) - max(stage_spec.layer_start, hash_start),
+        )
+        text_config.num_hash_layers = stage_hash_layers
+
+
+def _rebase_attention_quant_config(quant_config, stage_spec: PipelineStageSpec) -> None:
+    # attention_configs is keyed by global layer index; each stage-local config
+    # must be rebased so its first owned layer is index 0.
+    attention_configs = getattr(quant_config, "attention_configs", None)
+    if not attention_configs:
+        return
+
+    rebased_configs = {}
+    if -1 in attention_configs:
+        rebased_configs[-1] = attention_configs[-1]
+    for layer_idx, attention_config in attention_configs.items():
+        if layer_idx == -1:
+            continue
+        if not isinstance(layer_idx, int):
+            raise ValueError(f"attention_configs keys must be layer indices, got {layer_idx!r}.")
+        if stage_spec.layer_start <= layer_idx < stage_spec.layer_end:
+            rebased_configs[layer_idx - stage_spec.layer_start] = attention_config
+    quant_config.attention_configs = rebased_configs
+
+
+def _slice_hf_layer_metadata(text_config, layer_start: int, layer_end: int) -> None:
+    # These fields are per-layer config metadata lists, not instantiated modules.
+    # Stage-local models rebuild their module stack from the sliced config.
+    for field_name in _LAYER_METADATA_FIELDS:
+        if not hasattr(text_config, field_name):
+            continue
+        values = getattr(text_config, field_name)
+        if isinstance(values, list):
+            if len(values) < layer_end:
+                raise ValueError(
+                    f"Cannot slice hf_config.{field_name} for pipeline layer range "
+                    f"{layer_start}:{layer_end}; only {len(values)} entries are available."
+                )
+            setattr(text_config, field_name, values[layer_start:layer_end])
+
+
+def _get_stage_boundary_roots(stage_model: torch.nn.Module) -> list[torch.nn.Module]:
+    roots = []
+    wrapper = getattr(stage_model, "_inner", None)
+    if isinstance(wrapper, torch.nn.Module):
+        roots.append(wrapper)
+    if hasattr(stage_model, "unwrap"):
+        unwrapped = stage_model.unwrap()
+        if isinstance(unwrapped, torch.nn.Module):
+            roots.append(unwrapped)
+
+    unique_roots = []
+    seen_ids = set()
+    for root in roots:
+        if id(root) in seen_ids:
+            continue
+        seen_ids.add(id(root))
+        unique_roots.append(root)
+    return unique_roots
+
+
+def _replace_boundary_paths(roots: list[torch.nn.Module], paths: tuple[str, ...]) -> None:
+    for root in roots:
+        for path in paths:
+            _replace_module_path_if_present(root, path)
+
+
+def _replace_module_path_if_present(root: torch.nn.Module, path: str) -> None:
+    parent = root
+    parts = path.split(".")
+    for part in parts[:-1]:
+        if not hasattr(parent, part):
+            return
+        parent = getattr(parent, part)
+        if not isinstance(parent, torch.nn.Module):
+            return
+
+    child_name = parts[-1]
+    if not hasattr(parent, child_name):
+        return
+    if isinstance(getattr(parent, child_name), torch.nn.Module):
+        setattr(parent, child_name, PPMissingLayer())
+
+
+_PASSTHROUGH_STAGE_KWARGS = ("attention_meta", "cache_position")
+
+
+class PipelineStageModel(torch.nn.Module):
+    """Wrap a stage-local model and enforce the PP stage I/O contract."""
+
+    def __init__(self, stage_spec: PipelineStageSpec, model: torch.nn.Module):
+        super().__init__()
+        self.stage_spec = stage_spec
+        self.model = model
+
+    @property
+    def weight_size(self) -> int:
+        return getattr(self.model, "weight_size", 0)
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run this stage with first/middle/last stage input semantics."""
+        if position_ids is None:
+            raise ValueError("PipelineStageModel.forward requires position_ids.")
+
+        if self.stage_spec.is_first:
+            if input_ids is None:
+                raise ValueError("The first pipeline stage requires input_ids.")
+            return self._forward_to_hidden_states(input_ids=input_ids, position_ids=position_ids, **kwargs)
+
+        if hidden_states is None:
+            raise ValueError("Non-first pipeline stages require hidden_states.")
+        if self.stage_spec.is_last:
+            return self.model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                inputs_embeds=hidden_states,
+                **kwargs,
+            )
+        return self._forward_to_hidden_states(
+            input_ids=None,
+            position_ids=position_ids,
+            inputs_embeds=hidden_states,
+            **kwargs,
+        )
+
+    def _forward_to_hidden_states(self, **kwargs) -> torch.Tensor:
+        """Run the wrapped model and return its intermediate hidden states."""
+        outputs = self.model.forward(output_intermediate_hidden_states=True, **kwargs)
+        if not isinstance(outputs, tuple) or len(outputs) < 2:
+            output_length = len(outputs) if isinstance(outputs, tuple) else "N/A"
+            raise ValueError(
+                "Non-last pipeline stages must return (logits, hidden_states) when "
+                "output_intermediate_hidden_states=True. "
+                f"Got {type(outputs).__name__} with length {output_length}."
+            )
+        hidden_states = outputs[1]
+        if not isinstance(hidden_states, torch.Tensor):
+            raise ValueError(
+                "Non-last pipeline stages must return hidden_states as a torch.Tensor in (logits, hidden_states). "
+                f"Got {type(hidden_states).__name__}."
+            )
+        return hidden_states
+
+
+class PipelineModel(torch.nn.Module):
+    """Container for stage-local models built from a PipelinePlan."""
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        plan: PipelinePlan,
+        stages: list[PipelineStageModel],
+    ):
+        super().__init__()
+        self.model_config = model_config
+        self.plan = plan
+        self.stages = torch.nn.ModuleList(stages)
+
+    @property
+    def weight_size(self) -> int:
+        return max((stage.weight_size for stage in self.stages), default=0)
+
+    @property
+    def is_vl_model(self) -> bool:
+        """Pipeline split models are text-only in this code path."""
+        return False
+
+    @property
+    def hf_config(self):
+        return self.model_config.hf_config
+
+    @property
+    def text_config(self):
+        return self.hf_config.get_text_config()
+
+    @property
+    def total_weight_size(self) -> int:
+        return sum(stage.weight_size for stage in self.stages)
+
+    @property
+    def num_hidden_layers(self) -> int:
+        mtp_config = getattr(self.model_config, "mtp_config", None)
+        mtp_layers = int(getattr(mtp_config, "num_mtp_layers", 0) or 0)
+        draft_layers = int(self.model_config.draft_num_layers()) if self.model_config.has_draft_spec() else 0
+        return self.plan.num_hidden_layers + mtp_layers + draft_layers
+
+    @property
+    def draft_hf_config(self):
+        """DFlash/DSpark draft HF config exposed by the last stage's wrapper.
+
+        Speculative configs are cleared on non-last stages, so only the last
+        stage's TransformerModel carries the DflashWrapper/DsparkWrapper (or
+        MtpWrapper) that owns ``draft_hf_config``. Returns None when no
+        wrapper exposes one; KV cache allocation must not fall back to the
+        target layout in that case.
+        """
+        if not self.stages:
+            return None
+        stage_model = self.stages[-1].model
+        # Peel torch.compile's OptimizedModule without unwrapping the
+        # speculative wrapper itself (ModelWrapperBase.unwrap would go too far).
+        stage_model = getattr(stage_model, "_orig_mod", stage_model)
+        inner = getattr(stage_model, "_inner", None)
+        return getattr(inner, "draft_hf_config", None)
+
+    @property
+    def hidden_size(self) -> int:
+        return self.text_config.hidden_size
+
+    @property
+    def head_dim(self) -> int:
+        return getattr(
+            self.text_config,
+            "head_dim",
+            self.hidden_size // self.text_config.num_attention_heads,
+        )
+
+    @property
+    def vocab_size(self) -> int:
+        return self.text_config.vocab_size
+
+    def forward(self, **input_kwargs) -> torch.Tensor:
+        """Execute all stage-local models serially and return final logits."""
+        hidden_states = None
+        logits = None
+        for stage in self.stages:
+            stage_kwargs, _ = build_pipeline_stage_kwargs(
+                stage.stage_spec,
+                input_kwargs,
+                hidden_states=hidden_states,
+            )
+            stage_output = stage(**stage_kwargs)
+            if stage.stage_spec.is_last:
+                logits = stage_output
+            else:
+                hidden_states = stage_output
+        if logits is None:
+            raise RuntimeError("PipelineModel.forward did not execute a last pipeline stage.")
+        return logits
+
+
+def build_pipeline_stage_kwargs(
+    stage_spec: PipelineStageSpec,
+    input_kwargs: dict[str, Any],
+    *,
+    hidden_states: Optional[torch.Tensor] = None,
+) -> tuple[dict[str, Any], PipelineStageCacheStats]:
+    """Select and rebase global inputs for one pipeline stage."""
+    if "position_ids" not in input_kwargs:
+        raise ValueError("Pipeline stage inputs require position_ids.")
+
+    stage_kwargs: dict[str, Any] = {"position_ids": input_kwargs["position_ids"]}
+    if stage_spec.is_first:
+        if "input_ids" not in input_kwargs:
+            raise ValueError("The first pipeline stage requires input_ids.")
+        stage_kwargs["input_ids"] = input_kwargs["input_ids"]
+    else:
+        if hidden_states is None:
+            raise ValueError("Non-first pipeline stages require hidden_states.")
+        # PipelineStageModel.forward owns the PP stage I/O contract and converts
+        # this wrapper-level hidden_states input to TransformerModel inputs_embeds.
+        stage_kwargs["hidden_states"] = hidden_states
+        if stage_spec.is_last and (stage_spec.extra_tail_layers + stage_spec.extra_draft_layers) > 0:
+            stage_kwargs["input_ids"] = input_kwargs["input_ids"]
+
+    for key in _PASSTHROUGH_STAGE_KWARGS:
+        if key in input_kwargs:
+            stage_kwargs[key] = input_kwargs[key]
+
+    # Qwen3.5 linear_attention placeholders are excluded from KV cache byte
+    # accounting only (kept in local_cache for forward). Indexer cache is unaffected.
+    kv_excluded_layers = input_kwargs.get("kv_cache_excluded_layer_indices", frozenset())
+    cache_stats: dict[str, tuple[int, float]] = {}
+    for cache_key, metric_key in (
+        ("kv_cache_by_layers", "kv_cache_per_token"),
+        ("indexer_cache_by_layers", "indexer_cache_per_token"),
+    ):
+        excluded_layers = kv_excluded_layers if cache_key == "kv_cache_by_layers" else frozenset()
+        cache_by_layers, cache_bytes, cache_per_token = _slice_layer_cache(
+            input_kwargs,
+            stage_spec,
+            cache_key=cache_key,
+            metric_key=metric_key,
+            excluded_layers=excluded_layers,
+        )
+        cache_stats[cache_key] = (cache_bytes, cache_per_token)
+        if cache_key in input_kwargs:
+            stage_kwargs[cache_key] = cache_by_layers
+            stage_kwargs[metric_key] = cache_per_token
+
+    if stage_spec.is_last and "sampling_metadata" in input_kwargs:
+        stage_kwargs["sampling_metadata"] = input_kwargs["sampling_metadata"]
+
+    kv_cache_bytes, kv_cache_per_token = cache_stats["kv_cache_by_layers"]
+    indexer_cache_bytes, indexer_cache_per_token = cache_stats["indexer_cache_by_layers"]
+    return stage_kwargs, PipelineStageCacheStats(
+        kv_cache_bytes=kv_cache_bytes,
+        kv_cache_per_token_bytes=kv_cache_per_token,
+        indexer_cache_bytes=indexer_cache_bytes,
+        indexer_cache_per_token_bytes=indexer_cache_per_token,
+    )
+
+
+def _slice_layer_cache(
+    input_kwargs: dict[str, Any],
+    stage_spec: PipelineStageSpec,
+    *,
+    cache_key: str,
+    metric_key: str,
+    excluded_layers: frozenset[int] = frozenset(),
+) -> tuple[dict[int, torch.Tensor], int, float]:
+    """Slice global layer-indexed cache into stage-local layer indices.
+
+    ``excluded_layers`` are layer indices whose placeholder must stay in
+    ``local_cache`` (forward/stage validation still indexes them) but must not
+    inflate ``total_bytes`` / ``selected_bytes``. This keeps the PP-stage KV
+    cache accounting consistent with ``_get_kv_cache_info`` and
+    ``ModelRunner.run_inference`` for models such as Qwen3.5 whose
+    ``linear_attention`` layers carry a placeholder but no real paged KV cache.
+    """
+    if cache_key not in input_kwargs:
+        return {}, 0, 0.0
+
+    cache_by_layers = input_kwargs[cache_key]
+    if not isinstance(cache_by_layers, dict):
+        raise ValueError(f"{cache_key} must be a layer-indexed dict for pipeline parallel execution.")
+
+    allow_sparse_layers = cache_key == "indexer_cache_by_layers"
+    layer_end = stage_spec.layer_end + stage_spec.extra_tail_layers + stage_spec.extra_draft_layers
+    if not allow_sparse_layers:
+        missing_layers = [
+            layer_idx for layer_idx in range(stage_spec.layer_start, layer_end) if layer_idx not in cache_by_layers
+        ]
+        if missing_layers:
+            raise ValueError(
+                f"{cache_key} is missing global layer(s) {missing_layers} required by pipeline stage {stage_spec.stage_id}."
+            )
+
+    total_bytes = 0
+    for layer_idx, cache in cache_by_layers.items():
+        if layer_idx in excluded_layers:
+            continue
+        total_bytes += int(bytes_of_tensor(cache))
+
+    local_cache = {}
+    selected_bytes = 0
+    for layer_idx in range(stage_spec.layer_start, layer_end):
+        if allow_sparse_layers and layer_idx not in cache_by_layers:
+            continue
+        cache = cache_by_layers[layer_idx]
+        # The placeholder stays in local_cache for layer-indexed forward, but
+        # is excluded from the stage's KV cache byte accounting.
+        local_cache[layer_idx - stage_spec.layer_start] = cache
+        if layer_idx not in excluded_layers:
+            selected_bytes += int(bytes_of_tensor(cache))
+    global_per_token_bytes = input_kwargs.get(metric_key, 0.0)
+    if total_bytes <= 0 or global_per_token_bytes <= 0:
+        return local_cache, selected_bytes, 0.0
+    return (
+        local_cache,
+        selected_bytes,
+        float(global_per_token_bytes) * selected_bytes / total_bytes,
+    )
+
+
+logger = logging.getLogger(__name__)
+
+_PP_COMM_TID_OFFSET = 10_000
+# Dedicated pseudo-thread for the pipeline-level overview track. Chrome Trace
+# viewers render one track per (pid, tid); a fixed tid far above the comm
+# offset keeps the overview separate from stage (tid == stage_id) and comm
+# (tid == _PP_COMM_TID_OFFSET + stage_id) tracks.
+_PP_OVERVIEW_TID = 20_000
+_MS_PER_US = 1e-3
+
+
+@dataclass
+class _PipelineStageRunResult:
+    stage_spec: PipelineStageSpec
+    output: Any
+    execution_time_s: dict[str, float]
+    table_result: Any
+    breakdowns: dict[str, dict[str, float]]
+    runtime_events: list[Any]
+    trace_events: list[dict[str, Any]]
+    cache_stats: PipelineStageCacheStats
+    peak_memory_usage_bytes: float
+    weight_size_bytes: int
+
+
+@dataclass
+class _PipelineTransferRunResult:
+    stats: PipelineTransferStats
+    output: torch.Tensor
+    table_result: Any
+    runtime_events: list[Any]
+    trace_events: list[dict[str, Any]]
+    peak_memory_usage_bytes: float
+
+
+class StageRunner:
+    """Run one PipelineStageModel under Runtime and MemoryTracker."""
+
+    def __init__(
+        self,
+        stage: PipelineStageModel,
+        perf_models,
+        device_profile: DeviceProfile,
+        *,
+        user_input: Optional[UserInputConfig] = None,
+    ):
+        self.stage = stage
+        self.perf_models = perf_models
+        self.device_profile = device_profile
+        self.user_input = user_input
+
+    @property
+    def stage_spec(self) -> PipelineStageSpec:
+        return self.stage.stage_spec
+
+    def run(
+        self,
+        stage_kwargs: dict[str, Any],
+        *,
+        cache_stats: PipelineStageCacheStats,
+        with_sampler: bool = False,
+        sampler: Optional[torch.nn.Module] = None,
+        runtime_observer=None,
+    ) -> _PipelineStageRunResult:
+        """Execute one stage and collect runtime, trace, and memory records."""
+        if with_sampler and sampler is None:
+            raise ValueError("StageRunner.run requires sampler when with_sampler=True.")
+        if with_sampler and "sampling_metadata" not in stage_kwargs:
+            raise ValueError("StageRunner.run requires sampling_metadata on the last stage when with_sampler=True.")
+
+        memory_tracker = MemoryTracker(self.device_profile)
+        with (
+            Runtime(
+                self.perf_models,
+                self.device_profile,
+                memory_tracker=memory_tracker,
+            ) as runtime,
+            torch.no_grad(),
+        ):
+            output = _primary_model_output(self.stage(**stage_kwargs))
+            if with_sampler:
+                _ = sampler(output, stage_kwargs["sampling_metadata"])
+
+        if runtime_observer is not None:
+            runtime_observer(runtime)
+
+        return _PipelineStageRunResult(
+            stage_spec=self.stage_spec,
+            output=output,
+            execution_time_s=runtime.total_execution_time_s(),
+            table_result=runtime.table_averages(
+                group_by_input_shapes=_dump_input_shapes(self.user_input),
+                dump_op_bound_results=_dump_op_bound_results(self.user_input),
+            ),
+            breakdowns=runtime.get_breakdowns(),
+            runtime_events=list(runtime.event_list),
+            trace_events=_tag_trace_events(
+                runtime.get_trace_events(),
+                name_prefix=f"pp_stage_{self.stage_spec.stage_id}",
+                metadata={"pp_stage": self.stage_spec.stage_id},
+                tid=self.stage_spec.stage_id,
+                thread_name=f"PP Stage {self.stage_spec.stage_id}",
+            ),
+            cache_stats=cache_stats,
+            peak_memory_usage_bytes=_safe_peak_memory_usage(memory_tracker),
+            weight_size_bytes=int(self.stage.weight_size),
+        )
+
+
+class PipelineCommunicator:
+    """Run PP stage-boundary communication as an explicit TensorCast op."""
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        perf_models,
+        device_profile: DeviceProfile,
+        *,
+        user_input: Optional[UserInputConfig] = None,
+    ):
+        self.model_config = model_config
+        self.perf_models = perf_models
+        self.device_profile = device_profile
+        self.user_input = user_input
+
+    def transfer(
+        self,
+        stage_spec: PipelineStageSpec,
+        hidden_states: torch.Tensor,
+        *,
+        runtime_observer=None,
+    ) -> _PipelineTransferRunResult:
+        """Transfer hidden states from this stage to the next PP stage."""
+        source_rank, target_rank = _stage_boundary_ranks(self.model_config.parallel_config, stage_spec.stage_id)
+        memory_tracker = MemoryTracker(self.device_profile)
+        with (
+            Runtime(
+                self.perf_models,
+                self.device_profile,
+                memory_tracker=memory_tracker,
+            ) as runtime,
+            torch.no_grad(),
+        ):
+            # PP currently transfers only the residual-applied hidden states.
+            output = torch.ops.tensor_cast.pipeline_send_recv(
+                hidden_states,
+                source_rank,
+                target_rank,
+                stage_spec.stage_id,
+                stage_spec.stage_id + 1,
+            )
+
+        transfer_stats = self._build_transfer_stats_from_runtime(stage_spec, hidden_states, runtime)
+
+        if runtime_observer is not None:
+            runtime_observer(runtime)
+
+        return _PipelineTransferRunResult(
+            stats=transfer_stats,
+            output=output,
+            table_result=runtime.table_averages(
+                group_by_input_shapes=_dump_input_shapes(self.user_input),
+                dump_op_bound_results=_dump_op_bound_results(self.user_input),
+            ),
+            runtime_events=list(runtime.event_list),
+            trace_events=_tag_trace_events(
+                runtime.get_trace_events(),
+                name_prefix=f"pp_comm_{transfer_stats.source_stage_id}_to_{transfer_stats.target_stage_id}",
+                metadata={
+                    "source_stage": transfer_stats.source_stage_id,
+                    "target_stage": transfer_stats.target_stage_id,
+                    "payload_bytes": transfer_stats.payload_bytes,
+                },
+                tid=_PP_COMM_TID_OFFSET + transfer_stats.source_stage_id,
+                thread_name=f"PP Comm {transfer_stats.source_stage_id}->{transfer_stats.target_stage_id}",
+            ),
+            peak_memory_usage_bytes=_safe_peak_memory_usage(memory_tracker),
+        )
+
+    def _build_transfer_stats_from_runtime(
+        self,
+        stage_spec: PipelineStageSpec,
+        hidden_states: torch.Tensor,
+        runtime: Runtime,
+    ) -> PipelineTransferStats:
+        payload_bytes = int(bytes_of_tensor(hidden_states))
+        found_transfer_event = False
+        for event in runtime.event_list:
+            if event.op_invoke_info.func != torch.ops.tensor_cast.pipeline_send_recv.default:
+                continue
+            found_transfer_event = True
+            if not event.perf_results:
+                logger.warning(
+                    "Pipeline send/recv stage %d->%d produced no performance results for %d payload bytes; "
+                    "transfer time falls back to 0.",
+                    stage_spec.stage_id,
+                    stage_spec.stage_id + 1,
+                    payload_bytes,
+                )
+                break
+            time_s_by_model = {
+                model_name: float(perf_result.execution_time_s)
+                for model_name, perf_result in event.perf_results.items()
+            }
+            perf_result = next(iter(event.perf_results.values()))
+            statistics = perf_result.statistics
+            transfer_time_s = float(perf_result.execution_time_s)
+            if payload_bytes > 0 and transfer_time_s == 0.0:
+                logger.warning(
+                    "Pipeline send/recv stage %d->%d estimated 0 transfer time for %d payload bytes; "
+                    "check performance model coverage.",
+                    int(statistics.get("source_stage_id", stage_spec.stage_id)),
+                    int(statistics.get("target_stage_id", stage_spec.stage_id + 1)),
+                    payload_bytes,
+                )
+            return PipelineTransferStats(
+                source_stage_id=int(statistics.get("source_stage_id", stage_spec.stage_id)),
+                target_stage_id=int(statistics.get("target_stage_id", stage_spec.stage_id + 1)),
+                payload_bytes=int(statistics.get("message_size_bytes", payload_bytes)),
+                time_s=transfer_time_s,
+                bandwidth_bytes_ps=float(statistics.get("bandwidth_bytes_ps", 0.0)),
+                latency_s=float(statistics.get("latency_s", 0.0)),
+                time_s_by_model=time_s_by_model,
+            )
+        if payload_bytes > 0 and not found_transfer_event:
+            logger.warning(
+                "Pipeline send/recv stage %d->%d produced no runtime event for %d payload bytes; "
+                "transfer time falls back to 0.",
+                stage_spec.stage_id,
+                stage_spec.stage_id + 1,
+                payload_bytes,
+            )
+        return PipelineTransferStats(
+            source_stage_id=stage_spec.stage_id,
+            target_stage_id=stage_spec.stage_id + 1,
+            payload_bytes=payload_bytes,
+            time_s=0.0,
+            bandwidth_bytes_ps=0.0,
+            latency_s=0.0,
+        )
+
+
+class PipelineRunner:
+    """Execute all PP stages in order and merge compute, comm, and memory metrics."""
+
+    def __init__(
+        self,
+        model: PipelineModel,
+        perf_models,
+        device_profile: DeviceProfile,
+        *,
+        user_input: Optional[UserInputConfig] = None,
+    ):
+        self.model = model
+        self.perf_models = perf_models
+        self.device_profile = device_profile
+        _validate_pipeline_device_grid(model.model_config, device_profile)
+        self.user_input = user_input
+        self.communicator = PipelineCommunicator(
+            model.model_config,
+            perf_models,
+            device_profile,
+            user_input=user_input,
+        )
+        self.stage_runners = [
+            StageRunner(
+                stage,
+                perf_models,
+                device_profile,
+                user_input=user_input,
+            )
+            for stage in model.stages
+        ]
+
+    def run(
+        self,
+        input_kwargs: dict[str, Any],
+        *,
+        with_sampler: bool = False,
+        sampler: Optional[torch.nn.Module] = None,
+        runtime_observer=None,
+    ) -> PipelineRunResult:
+        """Run stages once in order, estimate transfers, and merge PP metrics."""
+        logits, stage_results, transfers = self._run_stage_chain(
+            input_kwargs,
+            with_sampler=with_sampler,
+            sampler=sampler,
+            runtime_observer=runtime_observer,
+        )
+        return self._build_run_result(logits, stage_results, transfers)
+
+    def _run_stage_chain(
+        self,
+        input_kwargs: dict[str, Any],
+        *,
+        with_sampler: bool = False,
+        sampler: Optional[torch.nn.Module] = None,
+        runtime_observer=None,
+    ) -> tuple[torch.Tensor, list[_PipelineStageRunResult], list[_PipelineTransferRunResult]]:
+        """Run one token chunk through all stages and return raw stage results."""
+        stage_results: list[_PipelineStageRunResult] = []
+        transfers: list[_PipelineTransferRunResult] = []
+        hidden_states = None
+        logits = None
+
+        for stage_runner in self.stage_runners:
+            stage_kwargs, cache_stats = build_pipeline_stage_kwargs(
+                stage_runner.stage_spec,
+                input_kwargs,
+                hidden_states=hidden_states,
+            )
+            stage_result = stage_runner.run(
+                stage_kwargs,
+                cache_stats=cache_stats,
+                with_sampler=with_sampler and stage_runner.stage_spec.is_last,
+                sampler=sampler,
+                runtime_observer=runtime_observer,
+            )
+            stage_results.append(stage_result)
+
+            if stage_runner.stage_spec.is_last:
+                logits = stage_result.output
+                continue
+
+            transfer_result = self.communicator.transfer(
+                stage_runner.stage_spec,
+                stage_result.output,
+                runtime_observer=runtime_observer,
+            )
+            hidden_states = transfer_result.output
+            transfers.append(transfer_result)
+
+        if logits is None:
+            raise RuntimeError("PipelineRunner did not execute a last pipeline stage.")
+
+        return logits, stage_results, transfers
+
+    def _build_run_result(
+        self,
+        logits: torch.Tensor,
+        stage_results: list[_PipelineStageRunResult],
+        transfer_results: list[_PipelineTransferRunResult],
+    ) -> PipelineRunResult:
+        """Merge per-stage runtime data into the public pipeline result."""
+        transfers = [result.stats for result in transfer_results]
+        stage_execution_time_s: dict[str, list[float]] = {}
+        for result in stage_results:
+            for model_name, execution_time_s in result.execution_time_s.items():
+                stage_execution_time_s.setdefault(model_name, []).append(execution_time_s)
+
+        execution_time_s = {
+            model_name: _pipeline_total_time_s(stage_times, transfers, model_name=model_name)
+            for model_name, stage_times in stage_execution_time_s.items()
+        }
+        breakdowns = _merge_breakdowns(result.breakdowns for result in stage_results)
+        breakdowns.update(_pipeline_parallel_breakdowns(stage_execution_time_s, transfers))
+        # Attribute transfer workspace to the source stage so top-level peak and
+        # per-stage breakdown stay rank-consistent.
+        outgoing_transfer_peak = _stage_outgoing_transfer_peak(transfer_results)
+        effective_peak = {
+            result.stage_spec.stage_id: max(
+                float(result.peak_memory_usage_bytes),
+                float(outgoing_transfer_peak.get(result.stage_spec.stage_id, 0.0)),
+            )
+            for result in stage_results
+        }
+        summary_stage = max(
+            stage_results,
+            key=lambda result: effective_peak.get(result.stage_spec.stage_id, 0.0),
+            default=None,
+        )
+        summary_stage_id = summary_stage.stage_spec.stage_id if summary_stage is not None else None
+        summary_peak_bytes = effective_peak.get(summary_stage_id, 0.0) if summary_stage is not None else 0.0
+        summary_cache_stats = summary_stage.cache_stats if summary_stage is not None else PipelineStageCacheStats()
+        summary_activation_bytes = _stage_activation_memory_bytes(summary_stage)
+        stage_latency_breakdown = _stage_latency_breakdown_entries(stage_results, transfers)
+        stage_memory_breakdown = [
+            _stage_memory_breakdown_entry(result, effective_peak.get(result.stage_spec.stage_id, 0.0))
+            for result in stage_results
+        ]
+        pipeline_profile = _build_pipeline_profile(stage_results, transfers)
+        perf_model_name = self.perf_models[0].name if self.perf_models else None
+        return PipelineRunResult(
+            logits=logits,
+            execution_time_s=execution_time_s,
+            table_result=_join_stage_tables(stage_results, transfer_results),
+            breakdowns=breakdowns,
+            runtime_event_list=(
+                _aggregate_runtime_events(
+                    stage_results,
+                    perf_model_name,
+                    lambda result: f"pp_stage_{result.stage_spec.stage_id}",
+                )
+                + _aggregate_runtime_events(
+                    transfer_results,
+                    perf_model_name,
+                    lambda result: f"pp_comm_{result.stats.source_stage_id}_to_{result.stats.target_stage_id}",
+                )
+            ),
+            peak_memory_usage_bytes=summary_peak_bytes,
+            kv_cache_size_bytes=summary_cache_stats.kv_cache_bytes,
+            kv_cache_per_token_bytes=summary_cache_stats.kv_cache_per_token_bytes,
+            indexer_cache_size_bytes=summary_cache_stats.indexer_cache_bytes,
+            indexer_cache_per_token_bytes=summary_cache_stats.indexer_cache_per_token_bytes,
+            model_weight_size_bytes=summary_stage.weight_size_bytes if summary_stage is not None else 0,
+            model_activation_size_bytes=summary_activation_bytes,
+            stage_latency_breakdown=stage_latency_breakdown,
+            stage_memory_breakdown=stage_memory_breakdown,
+            pipeline_profile=pipeline_profile,
+            trace_events=_pipeline_global_trace_events(stage_results, transfer_results),
+        )
+
+    @staticmethod
+    def export_chrome_trace(path: str, trace_events: list[dict]) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"displayTimeUnit": "ms", "traceEvents": trace_events}, f)
+        summary = _pipeline_trace_layout_summary(trace_events)
+        if summary:
+            print(summary)
+
+
+def _pipeline_trace_layout_summary(trace_events: list[dict]) -> str:
+    """Describe where each PP track sits on the shifted global timeline.
+
+    PP stages run sequentially, so slices of stages after the first only show
+    up in the later part of the timeline. Point users at the full range and
+    the overview track so a partially zoomed viewer does not read later stage
+    tracks as empty.
+    """
+    ranges_us_by_tid: dict[int, list[int]] = {}
+    names_by_tid = _collect_track_names(trace_events)
+    for trace_event in trace_events:
+        if trace_event.get("ph") != "X" or trace_event.get("tid") is None:
+            continue
+        _record_trace_range(
+            ranges_us_by_tid,
+            int(trace_event["tid"]),
+            int(trace_event.get("ts", 0)),
+            int(trace_event.get("ts", 0)) + int(trace_event.get("dur", 0)),
+        )
+    stage_tids = sorted(tid for tid in ranges_us_by_tid if tid < _PP_COMM_TID_OFFSET and tid != _PP_OVERVIEW_TID)
+    if not stage_tids:
+        return ""
+    segments = []
+    for tid in sorted(ranges_us_by_tid, key=lambda tid: ranges_us_by_tid[tid][0]):
+        # The overview track spans every other track by construction and is
+        # already described by the trailing full-pipeline-range sentence, so
+        # listing it again would only repeat the same range.
+        if tid == _PP_OVERVIEW_TID:
+            continue
+        name = names_by_tid.get(tid, f"PP track {tid}")
+        # Thread names already carry the range suffix in exported events.
+        if "[" not in name:
+            name = f"{name} [{_format_trace_range_us(*ranges_us_by_tid[tid])}]"
+        segments.append(name)
+    overview_start_us = min(bounds[0] for bounds in ranges_us_by_tid.values())
+    overview_end_us = max(bounds[1] for bounds in ranges_us_by_tid.values())
+    return (
+        "PP chrome trace layout (sequential single-request timeline): "
+        + " -> ".join(segments)
+        + f"; full pipeline range {_format_trace_range_us(overview_start_us, overview_end_us)}"
+        + " on the 'PP Overview' track. Later stages are placed after earlier ones on the timeline: "
+        + "if a later stage track looks empty, use the viewer's 'Fit all'/zoom-out to cover the full range."
+    )
+
+
+def _stage_outgoing_comm_times(
+    num_stages: int,
+    transfers: list[PipelineTransferStats],
+    *,
+    model_name: Optional[str] = None,
+) -> list[float]:
+    outgoing = [0.0 for _ in range(num_stages)]
+    for transfer in transfers:
+        if 0 <= transfer.source_stage_id < num_stages:
+            if model_name is None:
+                outgoing[transfer.source_stage_id] += transfer.time_s
+            else:
+                outgoing[transfer.source_stage_id] += _transfer_time_s_for_stage_latency(transfer, model_name)
+    return outgoing
+
+
+def _stage_latency_breakdown_entries(
+    stage_results: list[_PipelineStageRunResult],
+    transfers: list[PipelineTransferStats],
+) -> list[dict]:
+    """Build per-stage compute/communication latency entries for user output."""
+    if not stage_results:
+        return []
+
+    model_names: list[str] = []
+    for result in stage_results:
+        for model_name in result.execution_time_s:
+            if model_name not in model_names:
+                model_names.append(model_name)
+
+    num_stages = max(result.stage_spec.stage_id for result in stage_results) + 1
+    outgoing_by_model = {
+        model_name: _stage_outgoing_comm_times(num_stages, transfers, model_name=model_name)
+        for model_name in model_names
+    }
+
+    entries = []
+    for result in stage_results:
+        spec = result.stage_spec
+        compute_time_s = {}
+        outgoing_comm_time_s = {}
+        total_time_s = {}
+        for model_name in model_names:
+            compute = float(result.execution_time_s.get(model_name, 0.0))
+            outgoing = float(outgoing_by_model[model_name][spec.stage_id])
+            compute_time_s[model_name] = compute
+            outgoing_comm_time_s[model_name] = outgoing
+            total_time_s[model_name] = compute + outgoing
+        entries.append(
+            {
+                "stage_id": spec.stage_id,
+                "layer_start": spec.layer_start,
+                "layer_end": spec.layer_end,
+                "compute_time_s": compute_time_s,
+                "outgoing_comm_time_s": outgoing_comm_time_s,
+                "total_time_s": total_time_s,
+            }
+        )
+    return entries
+
+
+def _pipeline_parallel_breakdowns(
+    stage_execution_time_s: dict[str, list[float]],
+    transfers: list[PipelineTransferStats],
+) -> dict[str, dict[str, float]]:
+    breakdowns: dict[str, dict[str, float]] = {}
+    for model_name, stage_times in stage_execution_time_s.items():
+        compute_s = sum(stage_times)
+        communication_s = sum(_transfer_time_s(transfer, model_name) for transfer in transfers)
+        total_time_s = _pipeline_total_time_s(stage_times, transfers, model_name=model_name)
+        # TensorCast PP currently aggregates one model-forward simulation. It does
+        # not model fill-drain, 1F1B, or overlap scheduling, so bubble is expected
+        # to be 0 under this formula.
+        bubble_s = max(0.0, total_time_s - compute_s - communication_s)
+        breakdowns[f"{model_name}_pipeline_parallel"] = {
+            "compute": compute_s,
+            "communication": communication_s,
+            "bubble": bubble_s,
+        }
+    return breakdowns
+
+
+def _pipeline_total_time_s(
+    stage_times: list[float],
+    transfers: list[PipelineTransferStats],
+    *,
+    model_name: Optional[str] = None,
+) -> float:
+    if not stage_times:
+        return 0.0
+    return sum(stage_times) + sum(_transfer_time_s(transfer, model_name) for transfer in transfers)
+
+
+def _transfer_time_s(transfer: PipelineTransferStats, model_name: Optional[str]) -> float:
+    if model_name is not None and model_name in transfer.time_s_by_model:
+        return transfer.time_s_by_model[model_name]
+    return transfer.time_s
+
+
+# Keep stage latency strict per performance model; aggregate transfer.time_s would look over-precise here.
+def _transfer_time_s_for_stage_latency(transfer: PipelineTransferStats, model_name: str) -> float:
+    if model_name in transfer.time_s_by_model:
+        return transfer.time_s_by_model[model_name]
+    logger.warning(
+        "Pipeline transfer %d->%d has no time estimate for perf model %r; using 0.0 in stage latency breakdown.",
+        transfer.source_stage_id,
+        transfer.target_stage_id,
+        model_name,
+    )
+    return 0.0
+
+
+def _stage_activation_memory_bytes(result: Any) -> float:
+    """Stage-local activation = peak - weight - kv - indexer, clamped to >= 0.
+
+    All four terms come from the same stage, so the subtraction is physically
+    meaningful (unlike the cross-stage ``peak - kv - weight`` in model_runner,
+    which can mix different ranks and fabricate a non-existent rank).
+    """
+    if result is None:
+        return 0.0
+    cache_stats = result.cache_stats
+    return max(
+        0.0,
+        float(result.peak_memory_usage_bytes)
+        - float(result.weight_size_bytes)
+        - float(cache_stats.kv_cache_bytes)
+        - float(cache_stats.indexer_cache_bytes),
+    )
+
+
+def _stage_memory_breakdown_entry(result: Any, effective_peak_bytes: float = 0.0) -> dict:
+    """Build a per-stage memory breakdown dict for the summary stage list.
+
+    All fields come from a single stage, so the entry is a self-consistent
+    per-rank memory snapshot. ``peak_bytes`` is the stage's effective peak
+    (max of runtime peak and its outgoing transfer peak), so it matches the
+    top-level peak when this stage is the summary. ``activation_bytes`` is
+    decomposed from the runtime peak (not the transfer peak), because the
+    transfer buffer is communication workspace, not stage-local activation.
+    """
+    if result is None:
+        return {}
+    spec = result.stage_spec
+    cache_stats = result.cache_stats
+    runtime_peak = float(result.peak_memory_usage_bytes)
+    return {
+        "stage_id": spec.stage_id,
+        "layer_start": spec.layer_start,
+        "layer_end": spec.layer_end,
+        "weight_bytes": int(result.weight_size_bytes),
+        "kv_cache_bytes": int(cache_stats.kv_cache_bytes),
+        "indexer_cache_bytes": int(cache_stats.indexer_cache_bytes),
+        "peak_bytes": int(max(runtime_peak, float(effective_peak_bytes))),
+        "activation_bytes": int(_stage_activation_memory_bytes(result)),
+    }
+
+
+def _stage_outgoing_transfer_peak(transfer_results: list[Any]) -> dict[int, float]:
+    """Map each source stage id to the max peak of transfers it originates.
+
+    A transfer's send/recv buffer is owned by its source rank, so the transfer
+    peak is attributed to the source stage for the purpose of selecting the
+    summary stage and reporting its effective peak.
+    """
+    outgoing: dict[int, float] = {}
+    for transfer in transfer_results:
+        source_stage_id = transfer.stats.source_stage_id
+        outgoing[source_stage_id] = max(outgoing.get(source_stage_id, 0.0), float(transfer.peak_memory_usage_bytes))
+    return outgoing
+
+
+def _build_pipeline_profile(
+    stage_results: list[_PipelineStageRunResult],
+    transfers: list[PipelineTransferStats],
+) -> Optional[PipelineProfile]:
+    """Build the structured ``PipelineProfile`` from stage/transfer results.
+
+    Returns ``None`` for an empty stage set so a degenerate run does not
+    synthesize a profile. All per-stage fields come from the same stage-local
+    result, and outgoing comm/payload are attributed to the source stage,
+    matching the existing latency and memory breakdown conventions.
+    """
+    if not stage_results:
+        return None
+
+    pp_size = stage_results[0].stage_spec.pp_size
+    layer_partition = tuple(spec.num_layers for spec in (r.stage_spec for r in stage_results))
+
+    # Collect the union of performance-model names across stages, preserving
+    # first-seen order so the profile is deterministic.
+    model_names: list[str] = []
+    for result in stage_results:
+        for model_name in result.execution_time_s:
+            if model_name not in model_names:
+                model_names.append(model_name)
+
+    num_stages = max(result.stage_spec.stage_id for result in stage_results) + 1
+    outgoing_comm_by_model = {
+        model_name: _stage_outgoing_comm_times(num_stages, transfers, model_name=model_name)
+        for model_name in model_names
+    }
+    # Outgoing payload bytes per source stage. Under the blocking contract each
+    # stage has at most one outgoing boundary, so sum == max in practice; sum is
+    # used to stay well-defined if a stage ever originates multiple transfers.
+    outgoing_payload_bytes: dict[int, int] = {}
+    for transfer in transfers:
+        source_stage_id = transfer.source_stage_id
+        outgoing_payload_bytes[source_stage_id] = outgoing_payload_bytes.get(source_stage_id, 0) + int(
+            transfer.payload_bytes
+        )
+
+    stage_profiles: list[PipelineStageProfile] = []
+    for result in stage_results:
+        spec = result.stage_spec
+        cache_stats = result.cache_stats
+        compute_by_model = {
+            model_name: float(result.execution_time_s.get(model_name, 0.0)) for model_name in model_names
+        }
+        outgoing_by_model = {
+            model_name: float(outgoing_comm_by_model[model_name][spec.stage_id]) for model_name in model_names
+        }
+        stage_profiles.append(
+            PipelineStageProfile(
+                stage_id=spec.stage_id,
+                layer_start=spec.layer_start,
+                layer_end=spec.layer_end,
+                compute_time_s_by_model=compute_by_model,
+                outgoing_comm_time_s_by_model=outgoing_by_model,
+                weight_bytes=int(result.weight_size_bytes),
+                activation_bytes=int(_stage_activation_memory_bytes(result)),
+                kv_cache_bytes=int(cache_stats.kv_cache_bytes),
+                kv_cache_per_token_bytes=float(cache_stats.kv_cache_per_token_bytes),
+                indexer_cache_bytes=int(cache_stats.indexer_cache_bytes),
+                indexer_cache_per_token_bytes=float(cache_stats.indexer_cache_per_token_bytes),
+                runtime_peak_bytes=int(result.peak_memory_usage_bytes),
+                outgoing_payload_bytes=int(outgoing_payload_bytes.get(spec.stage_id, 0)),
+            )
+        )
+
+    transfer_profiles = tuple(
+        PipelineTransferProfile(
+            source_stage_id=transfer.source_stage_id,
+            target_stage_id=transfer.target_stage_id,
+            payload_bytes=int(transfer.payload_bytes),
+            time_s_by_model=dict(transfer.time_s_by_model),
+            bandwidth_bytes_ps=float(transfer.bandwidth_bytes_ps),
+            latency_s=float(transfer.latency_s),
+        )
+        for transfer in transfers
+    )
+
+    return PipelineProfile(
+        pp_size=pp_size,
+        layer_partition=layer_partition,
+        stages=tuple(stage_profiles),
+        transfers=transfer_profiles,
+    )
+
+
+def _validate_pipeline_device_grid(model_config: ModelConfig, device_profile: DeviceProfile) -> None:
+    parallel_config = model_config.parallel_config
+    world_size = int(parallel_config.world_size)
+    device_capacity = int(device_profile.comm_grid.grid.numel())
+    if world_size > device_capacity:
+        raise ValueError(
+            f"Pipeline parallel world_size ({world_size}) exceeds device grid capacity ({device_capacity}) "
+            f"for device profile {device_profile.name}."
+        )
+
+
+def _merge_breakdowns(breakdowns_by_stage) -> dict[str, dict[str, float]]:
+    merged: dict[str, dict[str, float]] = {}
+    for breakdowns in breakdowns_by_stage:
+        for breakdown_name, breakdown in breakdowns.items():
+            entry = merged.setdefault(breakdown_name, {})
+            for category, value in breakdown.items():
+                entry[category] = entry.get(category, 0.0) + value
+    return merged
+
+
+def _join_stage_tables(
+    stage_results: list[Any],
+    transfer_results: list[Any],
+) -> str:
+    if not stage_results and not transfer_results:
+        return "No events recorded."
+    tables = [
+        (
+            f"[pipeline stage {result.stage_spec.stage_id} "
+            f"layers {result.stage_spec.layer_start}:{result.stage_spec.layer_end}]\n"
+            f"{result.table_result}"
+        )
+        for result in stage_results
+    ]
+    tables.extend(
+        (
+            f"[pipeline transfer {result.stats.source_stage_id}->{result.stats.target_stage_id} "
+            f"bytes={result.stats.payload_bytes}]\n"
+            f"{result.table_result}"
+        )
+        for result in transfer_results
+    )
+    return "\n\n".join(tables)
+
+
+def _aggregate_runtime_events(
+    runtime_results: list[Any],
+    perf_model_name: Optional[str],
+    name_prefix_for,
+) -> list[dict]:
+    aggregated: dict[str, dict[str, float]] = {}
+    for runtime_result in runtime_results:
+        name_prefix = name_prefix_for(runtime_result)
+        for event in runtime_result.runtime_events:
+            name = f"{name_prefix}:{event.op_invoke_info.func}"
+            entry = aggregated.setdefault(name, {"total": 0.0, "count": 0})
+            entry["count"] += 1
+            if perf_model_name is None:
+                continue
+            result = event.perf_results.get(perf_model_name)
+            if result is not None:
+                entry["total"] += result.execution_time_s
+    items = []
+    for name, entry in aggregated.items():
+        count = entry["count"]
+        total = entry["total"]
+        items.append(
+            {
+                "name": name,
+                "perf_model": perf_model_name,
+                "perf_total": total,
+                "perf_avg": total / count if count else 0.0,
+                "call_times": count,
+            }
+        )
+    items.sort(key=lambda x: x["perf_total"], reverse=True)
+    return items
+
+
+def _pipeline_global_trace_events(stage_results: list[Any], transfer_results: list[Any]) -> list[dict]:
+    transfer_by_source_stage = {result.stats.source_stage_id: result for result in transfer_results}
+    offsets_s_by_model: dict[str, float] = {}
+    trace_events: list[dict] = []
+    # Shifted X-event time bounds per tid, used to describe each track's
+    # visibility window and to build the pipeline overview track.
+    ranges_us_by_tid: dict[int, list[int]] = {}
+
+    def append_events(runtime_result: Any, duration_s_by_model: dict[str, float]) -> None:
+        for trace_event in runtime_result.trace_events:
+            shifted_event = dict(trace_event)
+            if shifted_event.get("ph") == "X":
+                model_name = shifted_event.get("cat")
+                offset_s = offsets_s_by_model.get(model_name, 0.0)
+                shifted_event["ts"] = int(shifted_event.get("ts", 0)) + int(round(offset_s * 1e6))
+                shifted_event["args"] = dict(shifted_event.get("args", {}))
+                shifted_event["args"]["pipeline_global_offset_us"] = int(round(offset_s * 1e6))
+                if shifted_event.get("tid") is not None:
+                    _record_trace_range(
+                        ranges_us_by_tid,
+                        int(shifted_event["tid"]),
+                        shifted_event["ts"],
+                        shifted_event["ts"] + int(shifted_event.get("dur", 0)),
+                    )
+            trace_events.append(shifted_event)
+
+        for model_name, duration_s in duration_s_by_model.items():
+            offsets_s_by_model[model_name] = offsets_s_by_model.get(model_name, 0.0) + float(duration_s)
+
+    for stage_result in stage_results:
+        append_events(stage_result, stage_result.execution_time_s)
+        transfer_result = transfer_by_source_stage.get(stage_result.stage_spec.stage_id)
+        if transfer_result is None:
+            continue
+        transfer_model_names = {
+            trace_event.get("cat") for trace_event in transfer_result.trace_events if trace_event.get("ph") == "X"
+        }
+        transfer_durations = {
+            model_name: _transfer_time_s(transfer_result.stats, model_name)
+            for model_name in transfer_model_names
+            if model_name is not None
+        }
+        append_events(transfer_result, transfer_durations)
+
+    if ranges_us_by_tid:
+        num_stages = max(result.stage_spec.stage_id for result in stage_results) + 1
+        _append_pipeline_overview_events(trace_events, ranges_us_by_tid, num_stages)
+        _suffix_track_names_with_ranges(trace_events, ranges_us_by_tid)
+
+    return trace_events
+
+
+def _record_trace_range(ranges_us_by_tid: dict[int, list[int]], tid: int, start_us: int, end_us: int) -> None:
+    """Grow the shifted [min start, max end] bounds recorded for one track tid."""
+    bounds = ranges_us_by_tid.setdefault(int(tid), [start_us, end_us])
+    bounds[0] = min(bounds[0], start_us)
+    bounds[1] = max(bounds[1], end_us)
+
+
+def _format_trace_range_us(start_us: int, end_us: int) -> str:
+    return f"{start_us * _MS_PER_US:.3f}-{end_us * _MS_PER_US:.3f} ms"
+
+
+def _append_pipeline_overview_events(
+    trace_events: list[dict],
+    ranges_us_by_tid: dict[int, list[int]],
+    num_stages: int,
+) -> None:
+    """Add a PP Overview track exposing the whole pipeline time range.
+
+    PP stages run sequentially, so slices of stages after the first sit in the
+    later part of the timeline. Viewers that open on a partial time window can
+    make those later stage tracks look empty. A full-range total slice with
+    per-stage/comm slices nested on a dedicated overview track makes the
+    pipeline extent visible at any zoom level without changing the serial
+    single-request time semantics.
+    """
+    overview_start_us = min(bounds[0] for bounds in ranges_us_by_tid.values())
+    overview_end_us = max(bounds[1] for bounds in ranges_us_by_tid.values())
+    if overview_end_us < overview_start_us:
+        return
+    overview_events: list[dict] = [
+        {
+            "name": "thread_name",
+            "ph": "M",
+            "pid": 0,
+            "tid": _PP_OVERVIEW_TID,
+            "args": {"name": f"PP Overview ({_format_trace_range_us(overview_start_us, overview_end_us)})"},
+        },
+        {
+            "name": "thread_sort_index",
+            "ph": "M",
+            "pid": 0,
+            "tid": _PP_OVERVIEW_TID,
+            "args": {"sort_index": -100},
+        },
+    ]
+    track_names_by_tid = _collect_track_names(trace_events)
+    # Total slice first so per-stage/comm slices nest inside it as children.
+    overview_events.append(
+        {
+            "name": f"PP Pipeline Total ({num_stages} stages)",
+            "cat": "pipeline_overview",
+            "ph": "X",
+            "ts": overview_start_us,
+            "dur": overview_end_us - overview_start_us,
+            "pid": 0,
+            "tid": _PP_OVERVIEW_TID,
+            "args": {
+                "pipeline_stage_count": num_stages,
+                "trace_start_ms": round(overview_start_us * _MS_PER_US, 3),
+                "trace_end_ms": round(overview_end_us * _MS_PER_US, 3),
+            },
+        }
+    )
+    for tid in sorted(ranges_us_by_tid):
+        if tid == _PP_OVERVIEW_TID:
+            continue
+        start_us, end_us = ranges_us_by_tid[tid]
+        overview_events.append(
+            {
+                "name": track_names_by_tid.get(tid, f"PP track {tid}"),
+                "cat": "pipeline_overview",
+                "ph": "X",
+                "ts": start_us,
+                "dur": end_us - start_us,
+                "pid": 0,
+                "tid": _PP_OVERVIEW_TID,
+                "args": {
+                    "trace_start_ms": round(start_us * _MS_PER_US, 3),
+                    "trace_end_ms": round(end_us * _MS_PER_US, 3),
+                },
+            }
+        )
+    trace_events.extend(overview_events)
+
+
+def _collect_track_names(trace_events: list[dict]) -> dict[int, str]:
+    """Map tid -> track display name from thread_name metadata events."""
+    names: dict[int, str] = {}
+    for trace_event in trace_events:
+        if trace_event.get("ph") == "M" and trace_event.get("name") == "thread_name":
+            names[int(trace_event["tid"])] = str(trace_event.get("args", {}).get("name", ""))
+    return names
+
+
+def _suffix_track_names_with_ranges(trace_events: list[dict], ranges_us_by_tid: dict[int, list[int]]) -> None:
+    """Append each track's shifted time range to its thread_name metadata."""
+    for trace_event in trace_events:
+        if trace_event.get("ph") != "M" or trace_event.get("name") != "thread_name":
+            continue
+        tid = trace_event.get("tid")
+        bounds = ranges_us_by_tid.get(tid)
+        if bounds is None:
+            continue
+        name = str(trace_event.get("args", {}).get("name", ""))
+        if not name or "[" in name:
+            continue
+        trace_event["args"] = dict(trace_event.get("args", {}))
+        trace_event["args"]["name"] = f"{name} [{_format_trace_range_us(bounds[0], bounds[1])}]"
+
+
+def _tag_trace_events(
+    trace_events: list[dict],
+    *,
+    name_prefix: str,
+    metadata: dict[str, Any],
+    tid: Optional[int] = None,
+    thread_name: Optional[str] = None,
+) -> list[dict]:
+    tagged_events = []
+    for trace_event in trace_events:
+        tagged_event = dict(trace_event)
+        tagged_event["args"] = dict(tagged_event.get("args", {}))
+        original_name = str(tagged_event.get("name", ""))
+        if tagged_event.get("ph") == "M":
+            if original_name == "thread_name":
+                if tid is not None:
+                    tagged_event["tid"] = tid
+                if thread_name is not None:
+                    tagged_event["args"]["name"] = thread_name
+            tagged_events.append(tagged_event)
+            continue
+
+        tagged_event["name"] = f"{name_prefix}:{original_name}"
+        if tid is not None:
+            tagged_event["tid"] = tid
+        tagged_event["args"].update(metadata)
+        tagged_events.append(tagged_event)
+    return tagged_events
+
+
+def _safe_peak_memory_usage(memory_tracker: MemoryTracker) -> float:
+    try:
+        return float(memory_tracker.peak_mem_usage())
+    except ValueError:
+        return 0.0
+
+
+__all__ = [
+    "PipelineCommunicator",
+    "PipelineModel",
+    "PipelineProfile",
+    "PipelineStageProfile",
+    "PipelineTransferProfile",
+    "PPMissingLayer",
+    "PipelinePlan",
+    "PipelineRunResult",
+    "PipelineRunner",
+    "PipelineStageCacheStats",
+    "PipelineStageModel",
+    "PipelineStageSpec",
+    "PipelineTransferStats",
+    "StageRunner",
+    "apply_stage_boundaries",
+    "build_pipeline_plan",
+    "build_pipeline_stage_kwargs",
+    "build_stage_model_config",
+    "build_stage_parallel_config",
+    "UnsupportedPPConfigurationError",
+]

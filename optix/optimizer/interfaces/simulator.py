@@ -1,0 +1,116 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2025 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from typing import ClassVar, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
+
+from ...config.config import OptimizerConfigField
+from ...config.constant import ProcessState, Stage
+from .custom_process import BaseDataField, CustomProcess
+
+
+class SimulatorInterface(CustomProcess, BaseDataField, ABC):
+    """
+    Operate service framework. Used to operate service-related functions.
+    """
+
+    required_executable: ClassVar[str | None] = None
+
+    @property
+    @abstractmethod
+    def base_url(self) -> str:
+        """
+        Get the base url property of the service
+        Returns:
+
+        """
+
+    @abstractmethod
+    def update_command(self) -> None:
+        """
+        Update service startup command. Update self.command property.
+        Returns: None
+
+        """
+
+    def update_config(self, params: Optional[tuple[OptimizerConfigField]] = None) -> bool:
+        """
+        Update service config file or other config based on params. Modify config file before service
+        startup based on passed parameter values so new config takes effect.
+
+        Args:
+            params: tuning parameter list, a tuple, each element defined by value and config_position.
+
+        Returns: None
+
+        """
+        return True
+
+    def stop(self, del_log: bool = True):
+        """
+        Runtime, other preparation work.
+
+        Returns:
+
+        """
+        super().stop(del_log)
+
+    def health(self) -> ProcessState:
+        """
+        Get the current service status.
+        Current implementation based on vllm url
+        Returns: None
+
+        """
+        last_process_stage = self.process_stage
+        process_res = super().health()
+        if process_res.stage == Stage.error:
+            return process_res
+        try:
+            with urlopen(self.base_url, timeout=10) as response:
+                status_code = response.status
+                response_text = response.read().decode("utf-8", errors="replace") if status_code != 200 else ""
+        except HTTPError as e:
+            response_text = e.read().decode("utf-8", errors="replace")
+            return ProcessState(
+                stage=Stage.error,
+                info=f"return code {e.code}. text {response_text}",
+            )
+        except (URLError, TimeoutError, OSError) as e:
+            if last_process_stage.stage == Stage.start:
+                return ProcessState(stage=Stage.start, info=str(e))
+            return ProcessState(stage=Stage.error, info=str(e))
+        else:
+            if status_code == 200:
+                return ProcessState(stage=Stage.running)
+            return ProcessState(
+                stage=Stage.error,
+                info=f"return code {status_code}. text {response_text}",
+            )
+
+    @contextmanager
+    def enable_simulation_model(self):
+        """
+        Start using simulation model for inference instead of real model.
+        Returns: None
+
+        """
+        # Enable simulation model instead of real model
+        yield True
+        # Disable simulation model instead of real model

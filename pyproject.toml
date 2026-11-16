@@ -1,0 +1,121 @@
+# Package ######################################################################
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "msmodeling"
+description = "Light-weight full-system simulation framework"
+readme = "README.md"
+version = "0.2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "aenum>=3.1.17",
+    "alembic>=1.18.5",
+    "blinker>=1.9.0",
+    "colorama>=0.4.6",
+    "compressed-tensors>=0.16.0",
+    "diffusers>=0.38.0",
+    "einops",
+    # Keep fastapi version range aligned with vllm dependency constraint
+    "fastapi>=0.133.0,<0.137",
+    "greenlet>=3.5.1",
+    "loguru",
+    "matplotlib>=3.10.9",
+    "modelscope>=1.37.1",
+    "numpy",
+    "openpyxl>=3.1.5",
+    "optree>=0.13.0",
+    "overrides>=7.7.0",
+    "pandas>=2.3.3",
+    "plotext>=5.3.2",
+    "prettytable>=3.17.0",
+    "psutil>=7.2.2",
+    "pydantic-settings",
+    "pyswarms",
+    "pyyaml>=6.0.3",
+    "salabim>=26.0.6",
+    "scipy>=1.15.3",
+    "sqlmodel>=0.0.39",
+    "strenum>=0.4.15",
+    "torch>=2.8,<=2.10",
+    "torchvision>=0.23.0",
+    "transformers>=5.16.0,<5.17.0",
+    "tomlkit>=0.13",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+msmodeling = "cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tensor_cast", "serving_cast", "cli", "optix", "web_ui"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"optix/config.toml" = "optix/config.toml"
+"tensor_cast/runtime_configs/draft_configs/dflash_draft_builtin.json" = "tensor_cast/runtime_configs/draft_configs/dflash_draft_builtin.json"
+
+# Test tools ###################################################################
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+# Default norecursedirs includes "build", which skips tests/regression/scripts/helpers/build/.
+norecursedirs = ["__pycache__"]
+markers = [
+    "nightly: do_compile=True large model cases, only run in nightly",
+    "npu: requires NPU hardware",
+    "network: requires live model Hub access (HuggingFace/ModelScope); excluded by default, run in nightly",
+]
+addopts = "-m 'not npu and not nightly and not network'"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:torch.jit._script",
+]
+
+# Coverage #####################################################################
+
+[tool.coverage.run]
+parallel = true
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/.pytest_cache/*",
+    "*/builtin_model/*"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "@abstractmethod",
+    "raise NotImplementedError",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
+
+[dependency-groups]
+lint = [
+    "pre-commit>=4.3.0",
+]
+ci = [
+    "parameterized>=0.9.0",
+    "pathspec>=0.12",
+    "pydantic>=2",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
+    "pyyaml>=6",
+    "tomli>=2.0; python_version < '3.11'",
+    "types-colorama>=0.4.15",
+]
+build = [
+    "tomli>=2.0 ; python_full_version < '3.11'",
+]

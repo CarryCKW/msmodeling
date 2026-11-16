@@ -1,0 +1,418 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import json
+import os
+import time
+from copy import deepcopy
+from math import inf, isfinite
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+from loguru import logger
+
+from ...config.constant import MULTIHOST_INFER_ENGINE
+
+from ...config.config import OptimizerConfigField, field_to_param
+from .candidates import Candidate, SearchResult, TrialResult, TrialFailure
+from .validation import validate_candidate, classify_failure
+from .topology import is_multihost_context
+
+
+def compute_slo_violated(perf, fitness_evaluator) -> bool | None:
+    """Return True/False/None for TPOT/TTFT SLO violation of a completed trial.
+
+    Hard-constraint semantics: ``ttft_slo`` / ``tpot_slo`` on the fitness
+    evaluator are treated as hard thresholds, independent of the soft penalty
+    weights in the fitness formula. Returns None when no threshold is available
+    or performance is missing.
+    """
+    if perf is None or fitness_evaluator is None:
+        return None
+    tpot = getattr(perf, "time_per_output_token", None)
+    ttft = getattr(perf, "time_to_first_token", None)
+    tpot_slo = getattr(fitness_evaluator, "tpot_slo", None)
+    ttft_slo = getattr(fitness_evaluator, "ttft_slo", None)
+    if not tpot_slo and not ttft_slo:
+        return None
+    violated = False
+    if tpot is not None and tpot_slo:
+        try:
+            violated = violated or float(tpot) > float(tpot_slo)
+        except (TypeError, ValueError):
+            pass
+    if ttft is not None and ttft_slo:
+        try:
+            violated = violated or float(ttft) > float(ttft_slo)
+        except (TypeError, ValueError):
+            pass
+    return violated
+
+
+def _trial_progress_entry(trial) -> dict:
+    """Build a progress-file entry for a completed trial, including per-trial
+    metrics (TTFT / TPOT / throughput) so the agent can report them live.
+    """
+    entry: dict = {
+        "candidate_id": trial.candidate_id,
+        "status": "done",
+        "fitness": trial.fitness,
+        "elapsed_s": trial.elapsed_seconds,
+        "slo_violated": trial.slo_violated,
+    }
+    perf = getattr(trial, "performance", None)
+    if perf is not None:
+        entry["performance"] = {
+            "generate_speed": getattr(perf, "generate_speed", None),
+            "time_to_first_token": getattr(perf, "time_to_first_token", None),
+            "time_per_output_token": getattr(perf, "time_per_output_token", None),
+            "success_rate": getattr(perf, "success_rate", None),
+            "throughput": getattr(perf, "throughput", None),
+        }
+    return entry
+
+
+def _load_elapsed_progress(path: Path, round_index: int) -> float:
+    """Restore accounted trial time without treating missing history as zero."""
+    if not path.exists():
+        if path.with_name(f"results.round-{round_index}.json").exists():
+            raise ValueError(f"Missing elapsed-time history: {path}")
+        return 0.0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("round") != round_index:
+        raise ValueError(f"Invalid progress round: {path}")
+
+    def seconds(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not isfinite(value) or value < 0:
+            raise ValueError(f"Invalid elapsed time in {path}: {value!r}")
+        return value
+
+    # Legacy snapshots contain only the latest attempt. Keep their known time,
+    # but never claim that overwritten attempts have been recovered.
+    latest = sum(seconds(t["elapsed_s"]) for t in data["trials"] if t.get("status") == "done")
+    total = seconds(data.get("cumulative_elapsed_s", latest))
+    if total < latest:
+        raise ValueError(f"Cumulative elapsed time is smaller than trial time: {path}")
+    return total
+
+
+def _write_progress(path: Path, progress: dict) -> None:
+    """Replace the budget snapshot atomically; persistence failure stops execution."""
+    temporary = None
+    try:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+            json.dump(progress, stream, indent=2, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+class AgentCandidateStrategy:
+    def __init__(self, run_dir, round_index=1, max_trials=None, time_limit_seconds=None, fitness_evaluator=None):
+        self.run_dir = Path(run_dir)
+        self.round_index = round_index
+        self.max_trials = max_trials
+        self.time_limit_seconds = time_limit_seconds
+        self.fitness_evaluator = fitness_evaluator
+
+    @property
+    def candidates_path(self):
+        return self.run_dir / f"candidates.round-{self.round_index}.json"
+
+    @property
+    def results_path(self):
+        return self.run_dir / f"results.round-{self.round_index}.json"
+
+    def run(self, scheduler, target_field, search_space_context=None):
+        context = search_space_context or {}
+        multihost = is_multihost_context(context)
+        if getattr(scheduler, "engine", None) == MULTIHOST_INFER_ENGINE:
+            from .topology import validate_simulator_topology
+
+            validate_simulator_topology(context, scheduler.simulator)
+        candidates = self._load_candidates()
+        if multihost:
+            archive = self.run_dir / f"context.round-{self.round_index}.json"
+            archive.write_text(json.dumps(context, indent=2, ensure_ascii=False), encoding="utf-8")
+        validations = [validate_candidate(context, c.to_dict() if hasattr(c, 'to_dict') else c) for c in candidates]
+        valid = [v for v in validations if v["valid"]]
+        if validations and not valid:
+            reasons = "; ".join(f"{v.get('candidate_id')}: {'; '.join(v['errors'])}" for v in validations)
+            logger.warning(
+                "Round {} runs 0 trials: all {} candidate(s) rejected by validation — {}",
+                self.round_index,
+                len(validations),
+                reasons,
+            )
+        trials = []
+        progress_path = self.run_dir / f"progress.round-{self.round_index}.json"
+        previous_elapsed = _load_elapsed_progress(progress_path, self.round_index)
+
+        def _now_iso():
+            return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+        def _update_progress(status, stage, completed_trials, valid_candidates):
+            completed_ids = {t.candidate_id for t in completed_trials if t is not None}
+            all_trials = [_trial_progress_entry(t) for t in completed_trials if t is not None]
+            pending_seen = False
+            for v in valid_candidates:
+                cid = v.get("candidate_id") or (v.get("candidate", {}) or {}).get("candidate_id", "")
+                if cid in completed_ids:
+                    continue
+                if not pending_seen:
+                    all_trials.append(
+                        {"candidate_id": cid, "status": "running" if stage == "trial_cold_start" else "pending"}
+                    )
+                    pending_seen = True
+                else:
+                    all_trials.append({"candidate_id": cid, "status": "pending"})
+            running_count = 1 if stage == "trial_cold_start" and len(completed_trials) < len(valid_candidates) else 0
+            progress = {
+                "round": self.round_index,
+                "status": status,
+                "stage": stage,
+                "total": len(valid_candidates),
+                "completed": len(completed_trials),
+                "running": running_count,
+                "failed": sum(1 for t in completed_trials if t is not None and t.fitness >= float("inf")),
+                "trials": all_trials,
+                # Base this on the snapshot loaded once per run, not the last
+                # update, so repeated progress writes cannot double-count time.
+                "cumulative_elapsed_s": previous_elapsed + sum(t.elapsed_seconds for t in completed_trials),
+                "timestamps": {"updated": _now_iso()},
+            }
+            _write_progress(progress_path, progress)
+
+        deadline = None
+        if self.time_limit_seconds and self.time_limit_seconds > 0:
+            deadline = time.monotonic() + self.time_limit_seconds
+
+        # 首 trial 前即写进度，避免冷启动期无任何信号（issue 2.1）
+        _update_progress("starting", "preparing", [], valid[: self.max_trials])
+
+        for validation in valid[: self.max_trials]:
+            if deadline and time.monotonic() >= deadline:
+                logger.warning("Time limit reached, stopping round {}", self.round_index)
+                break
+            _update_progress("running", "trial_cold_start", trials, valid[: self.max_trials])
+            trial = self._run_trial(validation, scheduler, target_field, context)
+            trials.append(trial)
+            _update_progress("running", "trial_completed", trials, valid[: self.max_trials])
+
+        # 保留最终状态（不再 unlink），Monitor 可据此区分"完成"与"卡死"
+        _update_progress("completed", "round_done", trials, valid[: self.max_trials])
+
+        # Write results with embedded validation
+        self._write_results(trials, validations)
+        # Hard-constraint preference: pick the best among SLO-compliant trials
+        # first; only fall back to the full pool when nothing is compliant.
+        compliant = [t for t in trials if t is not None and t.slo_violated is False]
+        pool = compliant if compliant else [t for t in trials if t is not None]
+        best = min(pool, key=lambda t: t.fitness, default=None)
+        best_candidate = None
+        if best:
+            best_candidate = next((c for c in candidates if c.candidate_id == best.candidate_id), None)
+        return SearchResult(
+            best_params=best.params if best else {},
+            best_fitness=best.fitness if best else inf,
+            trials=trials,
+            best_candidate=best_candidate,
+        )
+
+    def _load_candidates(self):
+        if not self.candidates_path.exists():
+            raise FileNotFoundError("Candidate file not found: {}".format(self.candidates_path))
+        data = json.loads(self.candidates_path.read_text(encoding="utf-8"))
+        if data.get("round") != self.round_index:
+            raise ValueError(
+                "Candidate file {} declares round {} but this is round {} — regenerate the "
+                "candidate file for the current round".format(self.candidates_path, data.get("round"), self.round_index)
+            )
+        return [Candidate.from_dict(item, i) for i, item in enumerate(data.get("candidates", []))]
+
+    def _run_trial(self, validation: dict, scheduler, target_field: list, search_space_context: dict | None = None):
+        multihost = is_multihost_context(search_space_context)
+        params = validation["params"]
+        resolved_field = self._params_to_target_field(params, target_field, search_space_context)
+        candidate_id = validation["candidate_id"]
+        if resolved_field is None:
+            failure = TrialFailure(
+                category="constraint",
+                sub_category="ratio",
+                message="Failed to resolve target field from candidate params",
+                suggested_action="fix_ratio",
+            )
+            return TrialResult(
+                params=params,
+                fitness=inf,
+                candidate_id=candidate_id,
+                source="agent",
+                error="Failed to resolve target field",
+                failure=failure,
+                metadata={"round_id": self.round_index},
+            )
+        position = field_to_param(tuple(resolved_field))
+        start = time.monotonic()
+        try:
+            # Decision-grade data: disable early exit so every trial produces
+            # complete metrics (mirrors PSO _run_complete_evaluation).
+            with scheduler.disable_early_exit():
+                perf = scheduler.run(position, tuple(resolved_field))
+            error_info = scheduler.error_info or "Eval failed"
+            if scheduler.last_outcome and getattr(scheduler.last_outcome, "status", None) == "failed":
+                fitness, error = inf, error_info
+                slo_violated = None
+            else:
+                fitness = (
+                    self.fitness_evaluator.minimum_algorithm(perf)
+                    if self.fitness_evaluator
+                    else (getattr(perf, "generate_speed", inf) or inf)
+                )
+                error = None
+                slo_violated = compute_slo_violated(perf, self.fitness_evaluator)
+        except Exception as exc:
+            logger.error("Trial failed for candidate {}: {}", candidate_id, exc)
+            perf = getattr(scheduler, "performance_index", None)
+            fitness, error = inf, str(exc)
+            slo_violated = None
+        elapsed = time.monotonic() - start
+
+        # Classify failure
+        failure = None
+        if error:
+            failure_dict = classify_failure(error, getattr(scheduler, "last_outcome", None))
+            if failure_dict:
+                failure = TrialFailure(
+                    category=failure_dict["category"],
+                    sub_category=failure_dict.get("sub_category", ""),
+                    message=failure_dict.get("message", error),
+                    evidence_line=failure_dict.get("evidence_line", ""),
+                    suggested_action=failure_dict.get("suggested_action", ""),
+                    offending_params=dict(params),
+                )
+
+        try:
+            scheduler.save_result(
+                fitness=fitness,
+                candidate_id=candidate_id,
+                run_dir=str(self.run_dir),
+            )
+        except Exception as exc:
+            logger.warning("Failed to save trial result: {}", exc)
+        metadata = {"round_id": self.round_index}
+        if multihost:
+            from copy import deepcopy
+
+            metadata["launch_plan"] = deepcopy(getattr(scheduler, "simulate_launch_plan", {}))
+            metadata["requested_params"] = dict(params)
+            effective = getattr(scheduler, "simulate_run_info", None)
+            if effective:
+                params = {field.name: field.value for field in effective}
+            metadata["parameter_metadata"] = [
+                {"name": field.name, "dtype": field.dtype, "config_position": field.config_position}
+                for field in resolved_field
+            ]
+        return TrialResult(
+            params=params,
+            fitness=fitness,
+            performance=perf,
+            candidate_id=candidate_id,
+            error=error,
+            source="agent",
+            elapsed_seconds=elapsed,
+            failure=failure,
+            metadata=metadata,
+            slo_violated=slo_violated,
+        )
+
+    def _params_to_target_field(
+        self, params: dict, target_field: list, search_space_context: dict | None = None
+    ) -> list:
+        """Keep configured field contracts and add active-space service fields.
+
+        ``params`` is the full output of validate_candidate: active-space defaults,
+        pinned constants and explicit candidate values have already been resolved.
+        This function deliberately does not implement a second default policy.
+        """
+        space = (search_space_context or {}).get("search_space", {})
+        schema = {item["name"]: item for group in ("parameters", "constants") for item in space.get(group, [])}
+        resolved = []
+        covered_names = set()
+        for field in target_field:
+            active = deepcopy(field)
+            item = schema.get(active.name)
+            if item is not None:
+                # Round-local domains govern tunable fields after TOML is frozen.
+                # Keep configured types, positions and derivation contracts; candidate
+                # validation checks that TOML constants cannot be unfrozen.
+                definition = active.model_dump()
+                definition.update(min=item["min"], max=item["max"])
+                if active.dtype == "enum":
+                    definition["dtype_param"] = item["choices"]
+                if active.constant is None:
+                    definition["constant"] = item.get("constant")
+                active = OptimizerConfigField(**definition)
+            covered_names.add(active.name)
+            if active.name in params:
+                value = params[active.name]
+                if isinstance(value, (list, dict)):
+                    value = json.dumps(value, ensure_ascii=False)
+                active.apply_value(value)
+            resolved.append(active)
+
+        for name, value in params.items():
+            if name in covered_names:
+                continue
+            item = schema.get(name)
+            if item is None:
+                continue  # Candidate validation rejects unregistered names.
+            if isinstance(value, (list, dict)):
+                value = json.dumps(value, ensure_ascii=False)
+            kwargs = {
+                "name": name,
+                "value": value,
+                "dtype": item.get("dtype", "str"),
+                "config_position": item.get("config_position", "run"),
+                "min": item.get("min", 0.0),
+                "max": item.get("max", 1.0),
+                "dtype_param": item.get("choices") if item.get("dtype") == "enum" else item.get("dtype_param"),
+            }
+            if item.get("constant") is not None:
+                kwargs["constant"] = item["constant"]
+            # Invalid field definitions must fail preflight instead of silently
+            # becoming untyped fields with different execution semantics.
+            active = OptimizerConfigField(**kwargs)
+            active.apply_value(value)
+            resolved.append(active)
+        return resolved
+
+    def _write_results(self, trials, validations=None):
+        self.results_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "round": self.round_index,
+            "trials": [t.to_dict() for t in trials],
+        }
+        if validations is not None:
+            data["validation"] = {
+                "valid_count": sum(1 for v in validations if v["valid"]),
+                "invalid_count": sum(1 for v in validations if not v["valid"]),
+                "candidates": validations,
+            }
+        self.results_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")

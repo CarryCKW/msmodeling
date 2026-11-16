@@ -1,0 +1,519 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Theory symbol bindings for the DeepSeek-V3 model category."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+import pytest
+
+from tools.model_diagnostics.domain import INPUT, OUTPUT, ExecutionPhase, ModelRunContext, ParallelContext, SourceKind
+from tools.model_diagnostics.organization.theory import build_theory_regions
+from tools.model_diagnostics.specification.context_env import build_theory_env
+
+_DEEPSEEK_CONFIG: dict[str, object] = {
+    "model_type": "deepseek_v32",
+    "features": ["compiled"],
+    "hidden_size": 7168,
+    "intermediate_size": 18432,
+    "moe_intermediate_size": 2048,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "first_k_dense_replace": 3,
+    "num_experts_per_tok": 8,
+    "num_attention_heads": 128,
+    "num_key_value_heads": 128,
+    "num_hidden_layers": 61,
+    "effective_num_hidden_layers": 1,
+    "vocab_size": 129280,
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "index_head_dim": 128,
+    "index_n_heads": 64,
+    "index_topk": 2048,
+    "torch_dtype": "float16",
+}
+
+
+def _context(
+    *,
+    phase: ExecutionPhase = ExecutionPhase.PREFILL,
+    config: dict[str, object] | None = None,
+    query_length: int = 2,
+    context_length: int | None = None,
+    batch_size: int = 1,
+    parallel: ParallelContext | None = None,
+) -> ModelRunContext:
+    return ModelRunContext(
+        model_name="deepseek-ai/DeepSeek-V3.2",
+        entrypoint="text_generate",
+        phase=phase,
+        batch_size=batch_size,
+        query_length=query_length,
+        context_length=context_length,
+        parallel=parallel or ParallelContext(),
+        model_config=dict(config) if config is not None else dict(_DEEPSEEK_CONFIG),
+        quantization_config={},
+    )
+
+
+def test_deepseek_v3_theory_env_binds_attention_symbols() -> None:
+    env = build_theory_env(_context())
+
+    assert (env["Qlora"], env["KVlora"]) == (1536, 512)
+    assert (env["QKnope"], env["QKrope"], env["Vh"], env["Hmla"]) == (128, 64, 128, 192)
+    assert (env["Tprefill"], env["Tdecode"]) == (env["T"], 0)
+    assert env["Dsa_k"] == 2
+    assert env["Dsa_topk"] == 2
+    assert env["MOE_COMBINE_DTYPE"] == "float32"
+
+
+@pytest.mark.parametrize("model_type", ("deepseek_v3", "glm_moe_dsa", "kimi_k2"))
+def test_deepseek_v3_theory_env_uses_activation_dtype_for_legacy_moe_combine(model_type: str) -> None:
+    env = build_theory_env(_context(config={**_DEEPSEEK_CONFIG, "model_type": model_type}))
+
+    assert env["MOE_COMBINE_DTYPE"] == "float16"
+
+
+@pytest.mark.parametrize(
+    ("model_type", "ep", "gate_domain"),
+    (
+        ("deepseek_v32", 1, "tmoe"),
+        ("deepseek_v32", 2, "tmoe"),
+        ("deepseek_v3", 1, "tmoe"),
+        ("deepseek_v3", 2, "t"),
+        ("glm_moe_dsa", 1, "tmoe"),
+        ("glm_moe_dsa", 2, "t"),
+        ("kimi_k2", 2, "tmoe"),
+    ),
+)
+def test_deepseek_v3_theory_env_binds_moe_gate_token_domain(
+    model_type: str,
+    ep: int,
+    gate_domain: str,
+) -> None:
+    env = build_theory_env(
+        _context(
+            config={**_DEEPSEEK_CONFIG, "model_type": model_type},
+            query_length=3,
+            parallel=ParallelContext(expert_parallel_size=ep),
+        )
+    )
+
+    assert env["MOE_GATE_TOKENS"] == (env["T"] if gate_domain == "t" else env["Tmoe"])
+    assert env["T"] == 3
+
+
+def test_deepseek_v3_theory_env_binds_decode_dsa_width() -> None:
+    env = build_theory_env(_context(phase=ExecutionPhase.DECODE, query_length=1, context_length=128))
+
+    assert env["S"] == 129
+    assert env["Dsa_k"] == 129
+    assert (env["Tprefill"], env["Tdecode"]) == (0, env["T"])
+
+
+def test_deepseek_v3_theory_env_defaults_lm_head_tp_to_tensor_parallel() -> None:
+    env = build_theory_env(_context(parallel=ParallelContext(tensor_parallel_size=2)))
+
+    assert env["LMTP"] == 2
+    assert env["Vtp"] == env["V"] // 2
+
+
+def test_deepseek_v3_theory_env_binds_routed_and_shared_experts() -> None:
+    env = build_theory_env(_context())
+
+    assert (env["E"], env["Ktop"], env["Fmoe"], env["Fe"]) == (256, 8, 2048, 2048)
+    assert (env["T"], env["Tmoe"], env["Te"]) == (2, 2, 16)
+    assert env["Nshared"] == 1
+    assert env["Fshared"] == 2048
+
+
+def test_deepseek_v3_theory_env_scales_shared_expert_width() -> None:
+    env = build_theory_env(_context(config={**_DEEPSEEK_CONFIG, "n_shared_experts": 2}))
+
+    assert env["Nshared"] == 2
+    assert env["Fshared"] == 4096
+
+
+def test_deepseek_v3_theory_env_zero_shared_binds_nothing() -> None:
+    env = build_theory_env(_context(config={**_DEEPSEEK_CONFIG, "n_shared_experts": 0}))
+
+    assert "Nshared" not in env
+    assert "Fshared" not in env
+    assert env["E"] == 256
+
+
+def test_qwen3_moe_config_binds_no_deepseek_symbols() -> None:
+    env = build_theory_env(
+        _context(
+            config={
+                "model_type": "qwen3_moe",
+                "features": ["compiled"],
+                "hidden_size": 2048,
+                "intermediate_size": 6144,
+                "moe_intermediate_size": 768,
+                "num_experts": 128,
+                "num_experts_per_tok": 8,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "num_hidden_layers": 48,
+                "effective_num_hidden_layers": 1,
+                "vocab_size": 151936,
+                "torch_dtype": "float16",
+            }
+        )
+    )
+
+    assert env["E"] == 128
+    assert "Nshared" not in env
+    assert "Qlora" not in env
+    assert "Dsa_k" not in env
+
+
+def test_deepseek_v3_spec_expands_dense_prefix_and_moe_layers() -> None:
+    from tools.model_diagnostics.builtin import create_stage_comparison_registry
+    from tools.model_diagnostics.specification.builtin_activation import create_builtin_operator_activation_registry
+    from tools.model_diagnostics.specification.loader import YamlModelDiagnosticsSpecLoader
+    from tools.model_diagnostics.specification.source_options import create_builtin_source_options_parsers
+    from tools.model_diagnostics.specification.theory_fragments import load_builtin_theory_fragment_registry
+
+    fragments = load_builtin_theory_fragment_registry()
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(fragment_registry=fragments),
+        fragment_registry=fragments,
+    )
+    spec = loader.materialize(
+        loader.load("deepseek_v3_v1"), _context(config={**_DEEPSEEK_CONFIG, "effective_num_hidden_layers": 5})
+    )
+    language = next(region for region in spec.regions if region.region_id == "language")
+
+    assert language.layer_layout == ("dense", "dense", "dense", "moe", "moe")
+    assert [stage.stage_id for stage in language.layer_specs["dense"].stages] == [
+        "mla_projection",
+        "sparse_attention",
+        "dense_ffn",
+    ]
+    assert [stage.stage_id for stage in language.layer_specs["moe"].stages] == [
+        "mla_projection",
+        "sparse_attention",
+        "moe_gate",
+        "moe_dispatch",
+        "moe_experts",
+        "moe_combine",
+        "shared_ffn",
+    ]
+    moe_combine = next(stage for stage in language.layer_specs["moe"].stages if stage.stage_id == "moe_combine")
+    theory = moe_combine.source_options[SourceKind.THEORY]
+    assert [operator.operator_name for operator in theory.operators] == ["unpermute_tokens", "mul", "sum"]
+
+
+def test_deepseek_v3_moe_gate_validates_fused_topk() -> None:
+    from tools.model_diagnostics.builtin import create_stage_comparison_registry
+    from tools.model_diagnostics.specification.builtin_activation import create_builtin_operator_activation_registry
+    from tools.model_diagnostics.specification.loader import YamlModelDiagnosticsSpecLoader
+    from tools.model_diagnostics.specification.source_options import create_builtin_source_options_parsers
+    from tools.model_diagnostics.specification.theory_fragments import load_builtin_theory_fragment_registry
+
+    fragments = load_builtin_theory_fragment_registry()
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(fragment_registry=fragments),
+        fragment_registry=fragments,
+    )
+    spec = loader.materialize(
+        loader.load("deepseek_v3_v1"),
+        _context(config={**_DEEPSEEK_CONFIG, "model_type": "deepseek_v3", "effective_num_hidden_layers": 4}),
+    )
+    language = next(region for region in spec.regions if region.region_id == "language")
+    moe_layer = language.layer_specs["moe"]
+    moe_gate = next(stage for stage in moe_layer.stages if stage.stage_id == "moe_gate")
+
+    theory = moe_gate.source_options[SourceKind.THEORY]
+    assert [operator.operator_name for operator in theory.operators] == ["mm", "moe_gating_top_k_softmax"]
+    fused = theory.operators[1]
+    assert set(fused.tensors) == {INPUT[0], OUTPUT[0], OUTPUT[1]}
+    assert fused.tensors[INPUT[0]].shape.expression == "[Tmoe, E]"
+    assert fused.tensors[OUTPUT[0]].dtype.expression == "float32"
+    assert fused.tensors[OUTPUT[1]].dtype.expression == "int64"
+    runtime = moe_gate.source_options[SourceKind.RUNTIME]
+    assert "moe_gating_top_k_softmax" not in runtime.ignored_operators
+
+
+def test_deepseek_v32_moe_gate_omits_fused_topk() -> None:
+    from tools.model_diagnostics.builtin import create_stage_comparison_registry
+    from tools.model_diagnostics.specification.builtin_activation import create_builtin_operator_activation_registry
+    from tools.model_diagnostics.specification.loader import YamlModelDiagnosticsSpecLoader
+    from tools.model_diagnostics.specification.source_options import create_builtin_source_options_parsers
+    from tools.model_diagnostics.specification.theory_fragments import load_builtin_theory_fragment_registry
+
+    fragments = load_builtin_theory_fragment_registry()
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(fragment_registry=fragments),
+        fragment_registry=fragments,
+    )
+    spec = loader.materialize(
+        loader.load("deepseek_v3_v1"),
+        _context(config={**_DEEPSEEK_CONFIG, "effective_num_hidden_layers": 4}),
+    )
+    language = next(region for region in spec.regions if region.region_id == "language")
+    moe_layer = language.layer_specs["moe"]
+    moe_gate = next(stage for stage in moe_layer.stages if stage.stage_id == "moe_gate")
+
+    theory = moe_gate.source_options[SourceKind.THEORY]
+    assert [operator.operator_name for operator in theory.operators] == ["mm"]
+
+
+def test_deepseek_v3_spec_omits_dsa_stage_without_dsa_config() -> None:
+    from tools.model_diagnostics.builtin import create_stage_comparison_registry
+    from tools.model_diagnostics.specification.builtin_activation import create_builtin_operator_activation_registry
+    from tools.model_diagnostics.specification.loader import YamlModelDiagnosticsSpecLoader
+    from tools.model_diagnostics.specification.source_options import create_builtin_source_options_parsers
+    from tools.model_diagnostics.specification.theory_fragments import load_builtin_theory_fragment_registry
+
+    config = {**_DEEPSEEK_CONFIG, "model_type": "deepseek_v3", "effective_num_hidden_layers": 4}
+    config.pop("index_topk")
+    fragments = load_builtin_theory_fragment_registry()
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(fragment_registry=fragments),
+        fragment_registry=fragments,
+    )
+
+    spec = loader.materialize(loader.load("deepseek_v3_v1"), _context(config=config))
+    language = next(region for region in spec.regions if region.region_id == "language")
+
+    for layer_spec in language.layer_specs.values():
+        assert "dsa_indexer" not in {stage.stage_id for stage in layer_spec.stages}
+        attention = next(stage for stage in layer_spec.stages if stage.stage_id == "sparse_attention")
+        theory = attention.source_options[SourceKind.THEORY]
+        assert all("INPUT[9]" not in {str(slot) for slot in operator.tensors} for operator in theory.operators)
+
+
+def test_deepseek_v3_sparse_attention_declares_stable_runtime_inputs() -> None:
+    from tools.model_diagnostics.builtin import create_stage_comparison_registry
+    from tools.model_diagnostics.specification.builtin_activation import create_builtin_operator_activation_registry
+    from tools.model_diagnostics.specification.loader import YamlModelDiagnosticsSpecLoader
+    from tools.model_diagnostics.specification.source_options import create_builtin_source_options_parsers
+    from tools.model_diagnostics.specification.theory_fragments import load_builtin_theory_fragment_registry
+
+    fragments = load_builtin_theory_fragment_registry()
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(fragment_registry=fragments),
+        fragment_registry=fragments,
+    )
+    spec = loader.materialize(loader.load("deepseek_v3_v1"), _context())
+    language = next(region for region in spec.regions if region.region_id == "language")
+
+    for layer_spec in language.layer_specs.values():
+        attention = next(stage for stage in layer_spec.stages if stage.stage_id == "sparse_attention")
+        theory = attention.source_options[SourceKind.THEORY]
+        sparse_attention_core = next(
+            operator for operator in theory.operators if operator.operator_name == "mla_sparse_attention_core"
+        )
+        sparse_attention = next(
+            operator for operator in theory.operators if operator.operator_name == "mla_sparse_attention"
+        )
+
+        assert set(sparse_attention_core.tensors) == {
+            INPUT[0],
+            INPUT[1],
+            INPUT[2],
+            INPUT[3],
+            INPUT[4],
+            INPUT[5],
+            INPUT[6],
+            INPUT[7],
+        }
+        assert sparse_attention_core.tensors[INPUT[0]].shape.expression == "[T, Lh, Hmla]"
+        assert sparse_attention_core.tensors[INPUT[1]].shape.expression == "[Tprefill, Lh, QKnope + Vh]"
+        assert sparse_attention_core.tensors[INPUT[2]].shape.expression == "[Tdecode, Lh, KVlora + QKrope]"
+        assert sparse_attention_core.tensors[INPUT[3]].shape.expression == "[Nblk, Bs, KVlora + QKrope]"
+        assert sparse_attention_core.tensors[INPUT[4]].shape.expression == "[B, Mb]"
+        assert set(sparse_attention.tensors) == {OUTPUT[0]}
+
+
+def _deepseek_spec(context: ModelRunContext):
+    from tools.model_diagnostics.builtin import create_stage_comparison_registry
+    from tools.model_diagnostics.specification.builtin_activation import create_builtin_operator_activation_registry
+    from tools.model_diagnostics.specification.loader import YamlModelDiagnosticsSpecLoader
+    from tools.model_diagnostics.specification.source_options import create_builtin_source_options_parsers
+    from tools.model_diagnostics.specification.theory_fragments import load_builtin_theory_fragment_registry
+
+    fragments = load_builtin_theory_fragment_registry()
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(fragment_registry=fragments),
+        fragment_registry=fragments,
+    )
+    return loader.materialize(loader.load("deepseek_v3_v1"), context)
+
+
+def test_deepseek_v3_prefill_declares_kv_projection_contract() -> None:
+    spec = _deepseek_spec(_context(config={**_DEEPSEEK_CONFIG, "model_type": "deepseek_v3"}))
+    language = next(region for region in spec.regions if region.region_id == "language")
+
+    for layer_spec in language.layer_specs.values():
+        projection = next(stage for stage in layer_spec.stages if stage.stage_id == "mla_projection")
+        theory = projection.source_options[SourceKind.THEORY]
+        kv_proj = next(operator for operator in theory.operators if operator.operator_name == "mm")
+        assert kv_proj.tensors[INPUT[0]].shape.expression == "[T, KVlora]"
+        assert kv_proj.tensors[OUTPUT[0]].shape.expression == "[Tprefill, Lh * (QKnope + Vh)]"
+    env = build_theory_env(_context())
+    regions = build_theory_regions(_context(), spec, {"language": (0,)}, ())
+    stage = next(stage for stage in regions[0].layers[0].stages if stage.stage_id == "mla_projection")
+    kv_call = next(call for call in stage.operator_calls if call.operator_name == "mm")
+    output = next(tensor for tensor in kv_call.tensors if tensor.slot == OUTPUT[0])
+    assert output.shape == (env["Tprefill"], env["Lh"] * (env["QKnope"] + env["Vh"]))
+
+
+def test_deepseek_v3_decode_omits_kv_projection_contract() -> None:
+    config = {**_DEEPSEEK_CONFIG, "model_type": "deepseek_v3"}
+    config.pop("index_topk")
+    spec = _deepseek_spec(
+        _context(
+            config=config,
+            phase=ExecutionPhase.DECODE,
+            query_length=1,
+            context_length=128,
+        )
+    )
+    language = next(region for region in spec.regions if region.region_id == "language")
+    for layer_spec in language.layer_specs.values():
+        assert all(stage.stage_id != "mla_kv_projection" for stage in layer_spec.stages)
+        projection = next(stage for stage in layer_spec.stages if stage.stage_id == "mla_projection")
+        theory = projection.source_options[SourceKind.THEORY]
+        assert [operator.operator_name for operator in theory.operators] == [
+            "qkv_a_projection",
+            "q_b_projection",
+        ]
+
+
+@pytest.mark.parametrize(
+    ("model_type", "expected_preparation_dtype"),
+    (("glm_moe_dsa", "bfloat16"), ("deepseek_v32", "int8")),
+)
+def test_compiled_dsa_preparation_and_kv_projection_have_independent_input_dtypes(
+    model_type: str, expected_preparation_dtype: str
+) -> None:
+    context = _context(config={**_DEEPSEEK_CONFIG, "model_type": model_type})
+    context = replace(
+        context,
+        model_config={**context.model_config, "torch_dtype": "bfloat16"},
+        quantization_config={"linear_input_dtype": "int8"},
+    )
+    spec = _deepseek_spec(context)
+    env = build_theory_env(context)
+    assert env["DSA_PREP_IN"] == expected_preparation_dtype
+    assert env["ACT"] == "bfloat16"
+    language = next(region for region in spec.regions if region.region_id == "language")
+    for layer_spec in language.layer_specs.values():
+        projection = next(stage for stage in layer_spec.stages if stage.stage_id == "mla_projection")
+        theory = projection.source_options[SourceKind.THEORY]
+        preparation = next(
+            operator
+            for operator in theory.operators
+            if operator.operator_name == "mm"
+            and operator.tensors[OUTPUT[0]].shape.expression == "[T, Dsa_dim + Dsa_heads]"
+        )
+        assert preparation.tensors[INPUT[0]].dtype.expression == "DSA_PREP_IN"
+        kv_projection = next(
+            operator
+            for operator in theory.operators
+            if operator.operator_name == "mm"
+            and operator.tensors[OUTPUT[0]].shape.expression == "[Tprefill, Lh * (QKnope + Vh)]"
+        )
+        assert kv_projection.tensors[INPUT[0]].dtype.expression == "ACT"
+
+
+@pytest.mark.parametrize(
+    ("parallel", "batch_size", "query_length", "operator_name", "expected_shape"),
+    (
+        (
+            ParallelContext(
+                tensor_parallel_size=2,
+                data_parallel_size=1,
+                expert_parallel_size=2,
+                moe_data_parallel_size=1,
+            ),
+            1,
+            3,
+            "mlapo",
+            (3, 64, 192),
+        ),
+        (
+            ParallelContext(
+                tensor_parallel_size=1,
+                data_parallel_size=2,
+                expert_parallel_size=1,
+                moe_data_parallel_size=2,
+            ),
+            1,
+            2,
+            "swiglu",
+            (4, 2048),
+        ),
+    ),
+    ids=("tp_local_mla_heads", "dp_moe_shared_tokens"),
+)
+def test_deepseek_v3_theory_uses_rank_local_parallel_shapes(
+    parallel: ParallelContext,
+    batch_size: int,
+    query_length: int,
+    operator_name: str,
+    expected_shape: tuple[int, ...],
+) -> None:
+    from tools.model_diagnostics.builtin import create_stage_comparison_registry
+    from tools.model_diagnostics.specification.builtin_activation import create_builtin_operator_activation_registry
+    from tools.model_diagnostics.specification.loader import YamlModelDiagnosticsSpecLoader
+    from tools.model_diagnostics.specification.source_options import create_builtin_source_options_parsers
+    from tools.model_diagnostics.specification.theory_fragments import load_builtin_theory_fragment_registry
+
+    context = _context(
+        config={**_DEEPSEEK_CONFIG, "effective_num_hidden_layers": 4, "enable_mlapo": True},
+        batch_size=batch_size,
+        query_length=query_length,
+        parallel=parallel,
+    )
+    fragments = load_builtin_theory_fragment_registry()
+    loader = YamlModelDiagnosticsSpecLoader(
+        comparison_registry=create_stage_comparison_registry(),
+        activation_registry=create_builtin_operator_activation_registry(),
+        source_options_parsers=create_builtin_source_options_parsers(fragment_registry=fragments),
+        fragment_registry=fragments,
+    )
+    spec = loader.materialize(loader.load("deepseek_v3_v1"), context)
+    regions = build_theory_regions(context, spec, {"language": (3,)}, ())
+    calls = [call for stage in regions[0].layers[0].stages for call in stage.operator_calls]
+    matching_calls = [call for call in calls if call.operator_name == operator_name]
+    call = matching_calls[0] if operator_name == "mlapo" else matching_calls[-1]
+
+    tensor = next(tensor for tensor in call.tensors if tensor.slot == OUTPUT[0])
+    assert tensor.shape == expected_shape

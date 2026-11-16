@@ -1,0 +1,123 @@
+{
+  "type": "text",
+  "name": "qwen3.5-27b-1610-prefill",
+  "description": "Qwen3.5-27B 1610 prefill, 1 query, qlen=16824, TP=2, W8A8, compile",
+  "initial_time_s": 2.198,
+  "baseline_time_s": 2.099,
+  "initial_tolerance": 0.1,
+  "baseline_tolerance": 0.3,
+  "baseline_max_increase_pct": 0.07,
+  "operator_top_n": 10,
+  "operator_tolerance": 0.1,
+  "compilation_config": ["enable_matmul_allreduce"],
+  "user_input": {
+    "device": "ATLAS_800_A3_560T_128G_DIE",
+    "model_id": "Qwen/Qwen3.5-27B",
+    "num_queries": 1,
+    "query_len": 16824,
+    "context_length": 0,
+    "prefix_cache_hit_rate": 0.0,
+    "do_compile": true,
+    "allow_graph_break": false,
+    "dump_input_shapes": false,
+    "chrome_trace": null,
+    "graph_log_url": null,
+    "log_level": null,
+    "quantize_linear_action": "W8A8_STATIC",
+    "quantize_lmhead": false,
+    "mxfp4_group_size": 32,
+    "quantize_attention_action": "DISABLED",
+    "enable_sequence_parallel": false,
+    "decode": false,
+    "num_mtp_tokens": 0,
+    "mtp_acceptance_rate": [
+      0.9,
+      0.6,
+      0.4,
+      0.2
+    ],
+    "num_hidden_layers_override": 0,
+    "disable_repetition": false,
+    "reserved_memory_gb": 0,
+    "world_size": 2,
+    "tp_size": 2,
+    "pp_size": 1,
+    "dp_size": null,
+    "o_proj_tp_size": null,
+    "o_proj_dp_size": null,
+    "mlp_tp_size": null,
+    "mlp_dp_size": null,
+    "lmhead_tp_size": null,
+    "lmhead_dp_size": null,
+    "ep_size": 1,
+    "moe_dp_size": 1,
+    "moe_tp_size": null,
+    "word_embedding_tp": null,
+    "enable_redundant_experts": false,
+    "enable_shared_expert_tp": false,
+    "enable_dispatch_ffn_combine": false,
+    "enable_external_shared_experts": false,
+    "host_external_shared_experts": false,
+    "block_size": 128,
+    "remote_source": "huggingface",
+    "image_batch_size": null,
+    "image_height": null,
+    "image_width": null,
+    "performance_model": [
+      "analytic"
+    ],
+    "profiling_database": null
+  },
+  "operators": [
+    {
+      "name": "tensor_cast.static_quant_linear.default",
+      "total_time_s": 0.7145030000000001,
+      "num_calls": 128
+    },
+    {
+      "name": "tensor_cast.static_quant_linear_all_reduce.default",
+      "total_time_s": 0.331863,
+      "num_calls": 128
+    },
+    {
+      "name": "tensor_cast.attention.default",
+      "total_time_s": 0.303414,
+      "num_calls": 16
+    },
+    {
+      "name": "aten.mul.Tensor",
+      "total_time_s": 0.19054900000000002,
+      "num_calls": 402
+    },
+    {
+      "name": "prims.convert_element_type.default",
+      "total_time_s": 0.13794,
+      "num_calls": 322
+    },
+    {
+      "name": "tensor_cast.linear_attn_chunk_gated_delta_rule.default",
+      "total_time_s": 0.134452,
+      "num_calls": 48
+    },
+    {
+      "name": "aten.pow.Tensor_Scalar",
+      "total_time_s": 0.09185299999999999,
+      "num_calls": 161
+    },
+    {
+      "name": "tensor_cast.quantize.default",
+      "total_time_s": 0.067887,
+      "num_calls": 256
+    },
+    {
+      "name": "aten.add.Tensor",
+      "total_time_s": 0.064732,
+      "num_calls": 321
+    },
+    {
+      "name": "tensor_cast.swiglu.default",
+      "total_time_s": 0.053401000000000004,
+      "num_calls": 64
+    }
+  ]
+}

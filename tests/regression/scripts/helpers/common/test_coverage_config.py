@@ -1,0 +1,117 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Tests for common.coverage_config."""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from scripts.helpers.common.coverage_config import (
+    corrupt_coverage_files,
+    cov_pytest_args,
+    product_roots,
+    pytest_xdist_args,
+)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+
+def test_product_roots_not_empty() -> None:
+    assert len(product_roots()) > 0
+
+
+def test_cov_pytest_args_packages_match_gate_policy_roots() -> None:
+    expected = tuple(p.rstrip("/") for p in product_roots())
+    args = cov_pytest_args()
+    for pkg in expected:
+        assert f"--cov={pkg}" in args
+
+
+# ---------------------------------------------------------------------------
+# cov_pytest_args
+# ---------------------------------------------------------------------------
+
+
+def test_cov_args_default_no_context_no_append() -> None:
+    expected = tuple(p.rstrip("/") for p in product_roots())
+    args = cov_pytest_args()
+    for pkg in expected:
+        assert f"--cov={pkg}" in args
+    assert "--cov-branch" in args
+    assert "--cov-context=test" not in args
+    assert "--cov-append" not in args
+    assert "--cov-report=" in args
+
+
+def test_cov_args_with_context() -> None:
+    args = cov_pytest_args(cov_context=True)
+    assert "--cov-context=test" in args
+
+
+def test_cov_args_with_append() -> None:
+    args = cov_pytest_args(append=True)
+    assert "--cov-append" in args
+
+
+def test_cov_args_both_context_and_append() -> None:
+    args = cov_pytest_args(cov_context=True, append=True)
+    assert "--cov-context=test" in args
+    assert "--cov-append" in args
+
+
+def test_corrupt_coverage_files_detects_unreadable_and_incomplete_schema(tmp_path: Path) -> None:
+    garbage = tmp_path / ".coverage.worker"
+    incomplete = tmp_path / ".coverage"
+    healthy = tmp_path / ".coverage.healthy"
+    missing = tmp_path / ".coverage.missing"
+    garbage.write_bytes(b"not sqlite")
+    with sqlite3.connect(incomplete) as connection:
+        connection.execute("CREATE TABLE coverage_schema (version integer)")
+    with sqlite3.connect(healthy) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE coverage_schema (id integer);
+            CREATE TABLE meta (id integer);
+            CREATE TABLE file (id integer);
+            CREATE TABLE context (id integer);
+            CREATE TABLE line_bits (id integer);
+            CREATE TABLE arc (id integer);
+            CREATE TABLE tracer (id integer);
+            """
+        )
+
+    damaged = corrupt_coverage_files((garbage, incomplete, healthy, missing))
+
+    assert damaged == (garbage, incomplete)
+
+
+def test_pytest_xdist_args_default_uses_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default path reads cpu_count in coverage_config and caps again in pytest_runner."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    assert pytest_xdist_args() == ["-n", "4", "--dist", "worksteal"]
+
+
+def test_pytest_xdist_args_with_collected_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """collected_count bypasses coverage_config cpu_count; xdist_worker_args still caps by cpu."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    assert pytest_xdist_args(collected_count=3) == ["-n", "3", "--dist", "worksteal"]

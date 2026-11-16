@@ -1,0 +1,83 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import math
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class StepDecision:
+    """Prefill/decode concurrency selected for one simulated mixed step."""
+
+    p_step: int
+    d_step: int
+
+
+@dataclass(frozen=True)
+class SchedulerState:
+    """Queue and token-budget snapshot used by a scheduler decision."""
+
+    # Requests that have completed prefill and can produce one decode token in this step.
+    ready_decode: int
+    # Requests waiting for the current prefill chunk shape.
+    pending_prefill: int
+    # New tokens computed by one prefill request in the current chunk.
+    chunk_query_len: int
+    # Scheduler-wide token budget for one prefill or mixed prefill/decode step.
+    max_batched_tokens: int
+    # Verification queries consume physical tokens, independently of accepted output.
+    decode_query_len: int = 1
+
+
+class Scheduler(ABC):
+    """Policy interface for selecting prefill/decode work in each simulation step."""
+
+    @abstractmethod
+    def decide(self, state: SchedulerState) -> StepDecision:
+        """Return how many prefill and decode requests should run next.
+
+        Implementations must base the decision only on SchedulerState. Latency is unavailable
+        during selection; the selected batch is evaluated by the model runner.
+        """
+        ...
+
+
+class DecodeFirstWithSlack(Scheduler):
+    """Default scheduler: prioritize decode, then admit prefill with a small slack budget."""
+
+    slack_ratio = 1.15
+
+    def decide(self, state: SchedulerState) -> StepDecision:
+        """Prefer ready decode work, then admit prefill within the slack-adjusted budget."""
+        # Preserve slack admission even with no ready decode; each chunk still respects the base budget.
+        limit = math.floor(state.max_batched_tokens * self.slack_ratio)
+        # Decode is prioritized because ready requests already exposed their first token to users.
+        if state.decode_query_len <= 0:
+            raise ValueError("decode_query_len must be positive")
+        d_step = min(state.ready_decode, state.max_batched_tokens // state.decode_query_len)
+        if state.chunk_query_len <= 0:
+            p_step = 0
+        else:
+            # Count physical verification queries, independently of accepted output tokens.
+            p_step = max(
+                0,
+                min(
+                    state.pending_prefill,
+                    math.floor((limit - d_step * state.decode_query_len) / state.chunk_query_len),
+                ),
+            )
+        return StepDecision(p_step=p_step, d_step=d_step)

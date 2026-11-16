@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import argparse
+import json
+import math
+import shlex
+import sys
+from pathlib import Path
+
+
+def read_json(path: str | None) -> dict:
+    text = Path(path).read_text(encoding="utf-8-sig") if path else sys.stdin.read()
+    return json.loads(text)
+
+
+def parse_parallel(label: str | None) -> dict:
+    result = {}
+    if not label:
+        return result
+    for part in label.split("|"):
+        if "=" not in part:
+            continue
+        key, value = part.strip().split("=", 1)
+        try:
+            result[key.strip().lower().replace("-", "_")] = int(value.strip())
+        except ValueError:
+            print(
+                f"Warning: cannot parse parallel parameter '{key.strip()}' value '{value.strip()}' as int, skipping",
+                file=sys.stderr,
+            )
+    return result
+
+
+def add_if(cmd: list[str], flag: str, value):
+    if value is not None:
+        cmd.extend([flag, str(value)])
+
+
+def base_cmd(data: dict, parallel: dict, include_op_bound: bool = False) -> list[str]:
+    cmd = ["python", "-m", "cli.inference.text_generate", str(data["model"])]
+    for key, flag in [
+        ("device", "--device"),
+        ("num_devices", "--num-devices"),
+        ("quantize_linear_action", "--quantize-linear-action"),
+        ("quantize_attention_action", "--quantize-attention-action"),
+        ("mxfp4_group_size", "--mxfp4-group-size"),
+    ]:
+        add_if(cmd, flag, data.get(key))
+    if data.get("compile"):
+        cmd.append("--compile")
+    add_if(cmd, "--tp-size", parallel.get("tp"))
+    add_if(cmd, "--dp-size", parallel.get("dp"))
+    add_if(cmd, "--ep-size", parallel.get("ep"))
+    add_if(cmd, "--moe-tp-size", parallel.get("moe_tp"))
+    add_if(cmd, "--moe-dp-size", parallel.get("moe_dp"))
+    if include_op_bound:
+        cmd.append("--dump-op-bound-results")
+    return cmd
+
+
+def shell_join(cmd: list[str]) -> str:
+    return " ".join(shlex.quote(str(part)) for part in cmd)
+
+
+def get_decode_context_length(data: dict) -> int:
+    """Return the full prompt context recorded for Decode command generation."""
+    context_length = data.get("decode_context_length", data.get("input_length"))
+    if context_length is None:
+        raise ValueError("decode_context_length is required when input_length is unavailable")
+    return int(context_length)
+
+
+def get_effective_input_length(data: dict) -> int:
+    """Return the Prefill token count recorded for command generation."""
+    if data.get("effective_input_length") is not None:
+        return int(data["effective_input_length"])
+    if data.get("input_length") is None:
+        raise ValueError("effective_input_length is required when input_length is unavailable")
+    input_length = int(data["input_length"])
+    hit_rate = float(data.get("prefix_cache_hit_rate", 0.0))
+    return max(1, input_length - math.floor(input_length * hit_rate))
+
+
+def add_prefill_shape(cmd: list[str], data: dict, effective_input_length: int) -> None:
+    """Add a Prefill shape that preserves cached prefix tokens as KV context."""
+    input_length = data.get("input_length")
+    hit_rate = float(data.get("prefix_cache_hit_rate", 0.0))
+    if input_length is None:
+        input_length = data.get("decode_context_length")
+    if input_length is None or hit_rate <= 0:
+        cmd.extend(["--query-length", str(effective_input_length), "--context-length", "0"])
+        return
+    cmd.extend(
+        [
+            "--query-length",
+            str(int(input_length)),
+            "--context-length",
+            "0",
+            "--prefix-cache-hit-rate",
+            str(hit_rate),
+        ]
+    )
+
+
+def build_aggregation(data: dict, include_op_bound: bool = False) -> dict:
+    output_length = int(data["output_length"])
+    max_batched_tokens = int(data.get("max_batched_tokens", 8192))
+    num_mtp_tokens = int(data.get("num_mtp_tokens", 0))
+    concurrency = int(data["concurrency"])
+    effective_input_length = get_effective_input_length(data)
+    decode_context_length = get_decode_context_length(data)
+    prefill_batch_size = max_batched_tokens // effective_input_length
+    if prefill_batch_size < 1:
+        raise ValueError("max_batched_tokens must be >= effective_input_length for aggregation validation")
+    parallel = parse_parallel(data.get("parallel"))
+
+    prefill = base_cmd(data, parallel, include_op_bound=include_op_bound)
+    prefill.extend(["--num-queries", str(prefill_batch_size)])
+    add_prefill_shape(prefill, data, effective_input_length)
+
+    decode = base_cmd(data, parallel, include_op_bound=include_op_bound)
+    decode.extend(
+        [
+            "--num-queries",
+            str(concurrency),
+            "--query-length",
+            str(num_mtp_tokens + 1),
+            "--context-length",
+            str(decode_context_length + output_length // 2),
+            "--decode",
+        ]
+    )
+
+    return {
+        "mode": "aggregation",
+        "effective_input_length": effective_input_length,
+        "prefill_batch_size": prefill_batch_size,
+        "partial_prefill_wave": concurrency % prefill_batch_size,
+        "prefill_command": shell_join(prefill),
+        "decode_command": shell_join(decode),
+    }
+
+
+def build_disaggregation(data: dict, include_op_bound: bool = False) -> dict:
+    output_length = int(data["output_length"])
+    concurrency = int(data["concurrency"])
+    num_mtp_tokens = int(data.get("num_mtp_tokens", 0))
+    decode_context_length = get_decode_context_length(data)
+    phase = data.get("phase")
+    if phase not in {"prefill", "decode"}:
+        raise ValueError("disaggregation input must include phase='prefill' or phase='decode'")
+    parallel = parse_parallel(data.get("parallel"))
+    cmd = base_cmd(data, parallel, include_op_bound=include_op_bound)
+    cmd.extend(["--num-queries", str(concurrency)])
+    if phase == "prefill":
+        effective_input_length = get_effective_input_length(data)
+        add_prefill_shape(cmd, data, effective_input_length)
+        return {"mode": "disaggregation", "phase": phase, "command": shell_join(cmd)}
+    cmd.extend(
+        [
+            "--query-length",
+            str(num_mtp_tokens + 1),
+            "--context-length",
+            str(decode_context_length + output_length // 2),
+            "--decode",
+        ]
+    )
+    return {"mode": "disaggregation", "phase": phase, "command": shell_join(cmd)}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build text_generate validation commands from a best-row JSON.")
+    parser.add_argument("path", nargs="?", help="Optional JSON file. Reads stdin if omitted.")
+    parser.add_argument("--mode", choices=["aggregation", "disaggregation"], required=True)
+    parser.add_argument(
+        "--include-op-bound",
+        action="store_true",
+        help="Append --dump-op-bound-results to generated text_generate commands.",
+    )
+    args = parser.parse_args()
+    data = read_json(args.path)
+    result = (
+        build_aggregation(data, include_op_bound=args.include_op_bound)
+        if args.mode == "aggregation"
+        else build_disaggregation(data, include_op_bound=args.include_op_bound)
+    )
+    json.dump(result, sys.stdout, ensure_ascii=True, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

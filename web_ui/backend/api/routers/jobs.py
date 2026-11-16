@@ -1,0 +1,566 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+"""Jobs router.
+
+POST /api/jobs — submit a job
+GET /api/jobs/{id} — poll job status/progress
+GET /api/jobs/{id}/log — fetch captured logs (text/plain)
+POST /api/jobs/{id}/cancel — cooperative cancel
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Annotated, Any
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse, FileResponse
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
+
+from api.schemas import JobResponse, JobStatusResponse, JobListItem
+from models.enums import JobStatus
+from services.repositories import JobRepository, ResultRepository
+from services.capture import read_log_tail
+from services.schema_registry import SchemaRegistry
+from services.result_view import assemble_result_envelope
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+#: Server-suggested polling interval (ms) for non-terminal jobs.
+#: Clients drive polling off this hint and fall back to a local default if absent.
+DEFAULT_POLL_INTERVAL_MS = 1500
+
+
+def get_job_manager(request: Request):
+    """Resolve the app-wide JobManager wired on startup (main.py lifespan)."""
+    return request.app.state.job_manager
+
+
+def _expand_job_cases_strict(module_id: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand a job's params into per-case dicts, RAISING on bad/oversized input.
+
+    Mirrors the worker's expansion. Raises ``ValueError`` when a multi-value
+    field is unparseable or the cartesian product exceeds the case cap
+    (``runners._multicase.MAX_CASES``). Used for submit-time preflight so the
+    error surfaces as a 4xx instead of being swallowed.
+    """
+    if module_id == "text_generate":
+        from runners.text_generate import _expand_cases
+
+        return _expand_cases(params)
+    if module_id == "video_generate":
+        from runners._multicase import expand_cases
+        from runners.video_generate import _VIDEO_MULTI_FIELDS
+
+        return expand_cases(params, _VIDEO_MULTI_FIELDS)
+    if module_id == "throughput_optimizer":
+        from runners._multicase import expand_cases
+        from runners.throughput_optimizer import _THROUGHPUT_MULTI_FIELDS
+
+        return expand_cases(params, _THROUGHPUT_MULTI_FIELDS)
+    return [params]
+
+
+def _expand_job_cases(module_id: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand a job's params into per-case param dicts (mirrors the worker's expansion).
+
+    Each runner has its own multi-case field definitions; dispatch here so the
+    API can compute the actual per-case CLI commands on demand (without storing
+    them in the DB). Single-value submits collapse to one case (matching the
+    worker's backward-compatible single-case path). Expansion failures fall back
+    to ``[params]`` so status polling for an already-submitted job never breaks.
+    """
+    try:
+        return _expand_job_cases_strict(module_id, params)
+    except Exception as exc:
+        logger.warning("Failed to expand cases for module %s: %s", module_id, exc)
+    return [params]
+
+
+def _to_status_response(job, **overrides):
+    """Build JobStatusResponse from a Job entity, computing command/params.
+
+    ``overrides`` are keyword arguments that replace the default values
+    (e.g. ``result_ready``, ``cancel_requested``). Used by both ``get_job``
+    and ``cancel_job`` to avoid duplication. Overrides take precedence over the
+    computed defaults (cancel_job forces ``result_ready=False``).
+    """
+    # Lazy import: the command reconstruction is pure but lives in the runners
+    # package; importing it here keeps the router import-light.
+    from runners._cli_command import build_cli_command_string
+
+    # Synthesize chrome trace path if enabled (so the command shows the actual path, not <auto>)
+    params_for_command = dict(job.params) if job.params else None
+    if params_for_command and params_for_command.get("chrome-trace-file") is True:
+        from runners._multicase import compute_case_hash
+        from services.trace_store import legacy_hash_path
+
+        case_hash = compute_case_hash(job.module_id, job.form_schema_version, params_for_command)
+        if case_hash and job.id:
+            params_for_command["chrome-trace-file"] = str(legacy_hash_path(job.id, case_hash))
+
+    command = build_cli_command_string(job.module_id, params_for_command) if params_for_command else None
+    # Per-case commands (mirrors what the worker actually executes after multi-
+    # case expansion). Single-case jobs collapse to [command].
+    commands = None
+    if params_for_command:
+        cases = _expand_job_cases(job.module_id, params_for_command)
+        commands = [build_cli_command_string(job.module_id, case) for case in cases]
+
+    fields = dict(
+        job_id=job.id,
+        module_id=job.module_id,
+        status=job.status.value,
+        progress=job.progress,
+        progress_text=job.progress_text or "",
+        label=job.label,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+        error=job.error,
+        error_detail=job.error_detail,
+        error_fields=job.error_fields,
+        result_ready=job.status == JobStatus.SUCCEEDED,
+        poll_interval_ms=DEFAULT_POLL_INTERVAL_MS,
+        command=command,
+        commands=commands,
+        params=job.params,
+    )
+    fields.update(overrides)
+    return JobStatusResponse(**fields)
+
+
+# --- Pydantic schemas (request/response) --------------------------------
+
+
+class JobSubmitRequest(BaseModel):
+    """Request schema for POST /api/jobs."""
+
+    module_id: str = Field(..., description="Module identifier (text_generate, video_generate, throughput_optimizer)")
+    form_schema_version: str = Field(..., description="Form schema version (semver)")
+    params: dict = Field(..., description="Form field values (validated client-side; runner validates internally)")
+    explicitly_touched: list[str] | None = Field(
+        None,
+        description="Field IDs the user explicitly interacted with (mirrors CLI argv-present semantics for wants_provided validators)",
+    )
+
+
+class JobListQuery(BaseModel):
+    """Query parameters for GET /api/jobs."""
+
+    module_id: str | None = None
+    status: JobStatus | None = None
+    limit: int = 50
+    offset: int = 0
+
+
+class JobResultResponse(BaseModel):
+    """Response schema for GET /api/jobs/{id}/result."""
+
+    job_id: str
+    module_id: str
+    form_schema: dict[str, Any]
+    records: list[dict[str, Any]]
+    result: dict[str, Any]
+
+
+# --- GET /api/jobs ----------------------------------------------------------------
+
+
+class JobListResponse(BaseModel):
+    """Paginated job list: the page items + the total count (for pagination UI)."""
+
+    items: list[JobListItem]
+    total: int
+
+
+@router.get("", response_model=JobListResponse)
+async def list_jobs(
+    job_repo: Annotated[JobRepository, Depends()],
+    module_id: str | None = None,
+    status: JobStatus | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> JobListResponse:
+    """List jobs with optional filtering and pagination.
+
+    Returns the page items plus the total count (matching the filter, ignoring
+    limit/offset) so the UI can render pagination controls.
+    """
+    jobs = job_repo.list_jobs(
+        module_id=module_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    total = job_repo.count_jobs(module_id=module_id, status=status)
+    return JobListResponse(
+        items=[
+            JobListItem(
+                job_id=job.id,
+                module_id=job.module_id,
+                label=job.label,
+                status=job.status.value,
+                progress=job.progress,
+                created_at=job.created_at,
+                completed_at=job.completed_at,
+            )
+            for job in jobs
+        ],
+        total=total,
+    )
+
+
+# --- POST /api/jobs ---------------------------------------------------------------
+
+
+@router.post("", response_model=JobResponse, status_code=201)
+async def create_job(
+    request: JobSubmitRequest,
+    job_repo: Annotated[JobRepository, Depends()],
+    job_manager: Annotated[Any, Depends(get_job_manager)],
+    background_tasks: BackgroundTasks,
+) -> JobResponse:
+    """Submit a new modeling job.
+
+    The job is persisted as ``pending`` and scheduled on the single-worker pool.
+    Returns 201 on acceptance (job may be queued if another is running).
+    """
+    from models.entities import Job
+    from models.enums import JobStatus
+
+    # Reject unknown form-schema versions early: a missing snapshot would later
+    # leave the job's result page unable to re-render the form.
+    schema_registry = SchemaRegistry()
+    if schema_registry.get_form_schema(request.module_id, request.form_schema_version) is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"Form schema version {request.form_schema_version} not found for module {request.module_id}"),
+        )
+
+    # Preflight the multi-case expansion: reject oversized fan-out (e.g. many
+    # comma-list values multiplying past the case cap) and unparseable multi-value
+    # fields BEFORE scheduling — otherwise the worker (or the state-polling expand
+    # via ``_expand_job_cases``) would swallow the error into a single case.
+    try:
+        _expand_job_cases_strict(request.module_id, request.params)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # NOTE: L1 declarative + L2 cross-field validation has been moved from here
+    # to execution-time (per-case) in the runners. This supports partial success:
+    # invalid cases are recorded with error details, valid cases execute normally.
+    # See services/case_validation.py for the shared validation logic.
+
+    # Module-specific submit-time checks (beyond spec.validators)
+    if request.module_id == "throughput_optimizer":
+        # PD ratio optimization requires both device-per-instance params
+        if request.params.get("enable-optimize-prefill-decode-ratio"):
+            if (
+                request.params.get("prefill-devices-per-instance") is None
+                or request.params.get("decode-devices-per-instance") is None
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="PD ratio optimization requires both prefill-devices-per-instance and decode-devices-per-instance to be specified",
+                )
+
+    # SECURITY: Normalize chrome-trace-file to boolean to prevent arbitrary file write.
+    # String paths from direct HTTP requests are coerced to True/False so _synth_trace_path
+    # generates safe managed paths. Invalid strings rejected with 400. CLI path unaffected.
+    params = dict(request.params)
+    _ctf = params.get("chrome-trace-file")
+    if isinstance(_ctf, str):
+        _ctf_lower = _ctf.strip().lower()
+        if _ctf_lower in {"true", "1", "yes", "on"}:
+            params["chrome-trace-file"] = True
+        elif _ctf_lower in {"false", "0", "no", "off"}:
+            params["chrome-trace-file"] = False
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"chrome-trace-file must be a boolean-like value (got {_ctf!r})",
+            )
+
+    # SECURITY: Idempotent submission via params_hash at API entry.
+    # Checks: 1) succeeded cache, 2) in-flight duplicates.
+    from services.params_hash import compute_params_hash
+
+    params_hash = compute_params_hash(request.module_id, request.form_schema_version, params)
+    logger.debug(f"[DEDUP] Computing params_hash={params_hash[:16]}... for module={request.module_id}")
+
+    # 1) Succeeded cache hit — reuse existing results
+    cached = job_repo.find_succeeded_by_params_hash(request.module_id, params_hash)
+    if cached is not None:
+        logger.debug(f"[DEDUP] Cache hit: returning existing succeeded job {cached.id}")
+        return JobResponse(job_id=cached.id, status=cached.status.value)
+
+    # 2) In-flight duplicate check
+    inflight = job_repo.find_inflight_by_params_hash(request.module_id, params_hash)
+    if inflight is not None:
+        logger.debug(f"[DEDUP] Inflight hit: returning existing job {inflight.id} (status={inflight.status})")
+        return JobResponse(job_id=inflight.id, status=inflight.status.value)
+
+    logger.debug("[DEDUP] No duplicate found, creating new job")
+
+    # Create Job entity with params_hash set at creation for concurrent dedup
+    job = Job(
+        module_id=request.module_id,
+        form_schema_version=request.form_schema_version,
+        params=params,
+        status=JobStatus.PENDING,
+        progress=0,
+        progress_text="",
+        label=f"{request.module_id} task",
+        explicitly_touched=request.explicitly_touched,
+        params_hash=params_hash,
+    )
+
+    # Submit to JobManager. SECURITY: Catch IntegrityError from partial unique index
+    # to handle TOCTOU race where concurrent requests pass app-level dedup.
+    try:
+        logger.debug(f"[DEDUP] Calling submit_async for job {job.id}")
+        submitted = await job_manager.submit_async(job)
+        logger.debug(f"[DEDUP] Job {job.id} submitted successfully")
+    except job_manager.InflightLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except IntegrityError as e:
+        logger.debug(f"[DEDUP] IntegrityError caught for job {job.id}: {e}")
+        # Race condition: query for existing in-flight job
+        existing = job_repo.find_inflight_by_params_hash(request.module_id, params_hash)
+        if existing is not None:
+            logger.debug(f"[DEDUP] Race condition resolved: returning existing inflight job {existing.id}")
+            return JobResponse(job_id=existing.id, status=existing.status.value)
+        # In-flight job may have completed; check succeeded cache
+        cached = job_repo.find_succeeded_by_params_hash(request.module_id, params_hash)
+        if cached is not None:
+            logger.debug(f"[DEDUP] Race condition resolved: returning cached job {cached.id}")
+            return JobResponse(job_id=cached.id, status=cached.status.value)
+        # Should not happen, but handle gracefully
+        logger.debug(f"[DEDUP] Race condition but no existing job found for hash {params_hash[:16]}...")
+        raise HTTPException(
+            status_code=409,
+            detail="Duplicate job submission detected but existing job not found",
+        ) from None
+
+    return JobResponse(
+        job_id=submitted.id,
+        status=submitted.status.value,
+    )
+
+
+# --- GET /api/jobs/{id}/trace/{seq} (Trace download) -----------------------
+# NOTE: This route must be defined BEFORE /{job_id} to avoid matching "trace" as a job_id
+
+
+@router.get("/{job_id}/trace/{seq}", response_class=FileResponse)
+async def get_job_trace(
+    job_id: str,
+    seq: int,
+    job_repo: Annotated[JobRepository, Depends()],
+) -> FileResponse:
+    """Download a specific case's Chrome trace JSON file.
+
+    Returns the Chrome trace file for case {seq} of job {job_id}.
+    Raises 404 if the job/seq doesn't exist or the trace file is missing.
+    """
+    job = job_repo.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    from services.trace_store import trace_path
+
+    trace_file = trace_path(job_id, seq)
+    if not trace_file.exists():
+        raise HTTPException(status_code=404, detail=f"Trace file for job {job_id} case {seq} not found")
+
+    return FileResponse(
+        trace_file,
+        media_type="application/json",
+        filename=f"chrome_trace_case_{seq}.json",
+        headers={"Content-Disposition": f'attachment; filename="chrome_trace_case_{seq}.json"'},
+    )
+
+
+# --- GET /api/jobs/{id} ----------------------------------------------------------
+
+
+@router.get("/{job_id}", response_model=JobStatusResponse)
+async def get_job(
+    job_id: str,
+    job_repo: Annotated[JobRepository, Depends()],
+    job_manager: Annotated[Any, Depends(get_job_manager)],
+) -> JobStatusResponse:
+    """Poll job status/progress.
+
+    Returns the job record with status, progress, progress_text, and error details.
+    Raises 404 if unknown job_id.
+
+    ``cancel_requested`` is surfaced from the JobManager's in-memory flag
+    (#89) — the flag is held in memory only (not persisted to DB) because it's
+    scoped to the job's worker lifetime; the poll response would otherwise
+    always read False from the DB.
+    """
+    job = job_repo.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    return _to_status_response(
+        job,
+        cancel_requested=job_manager.is_cancel_requested(job_id),
+    )
+
+
+# --- GET /api/jobs/{id}/log --------------------------------------------------
+
+
+@router.get("/{job_id}/log", response_class=PlainTextResponse)
+async def get_job_log(
+    job_id: str,
+    job_repo: Annotated[JobRepository, Depends()],
+    tail: Annotated[int, Query] = 200,
+) -> PlainTextResponse:
+    """Fetch captured runner stdout+logging as text/plain.
+
+    Returns the last ``tail`` lines (default 200) of the job's captured log.
+    Raises 404 if unknown job_id.
+    """
+    job = job_repo.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    log_content = read_log_tail(job_id, tail)
+    if not log_content and job.log_text:
+        # Cache-hit jobs (Phase C) have no log file — no worker ran — so serve
+        # the cached CLI log from the DB, applying the same tail.
+        lines = job.log_text.splitlines()
+        log_content = "\n".join(lines[-tail:] if tail and tail > 0 else lines)
+    return PlainTextResponse(content=log_content)
+
+
+# --- POST /api/jobs/{id}/cancel ------------------------------------------------
+
+
+@router.post("/{job_id}/cancel", response_model=JobStatusResponse)
+async def cancel_job(
+    job_id: str,
+    job_repo: Annotated[JobRepository, Depends()],
+    job_manager: Annotated[Any, Depends(get_job_manager)],
+) -> JobStatusResponse:
+    """Cooperatively request cancellation (research Area 3).
+
+    Sets ``cancel_requested`` (cooperative flag). The worker polls the flag
+    and, if true, discards its result and transitions to ``cancelled`` (if still
+    running). If the job already finished, this is a no-op (the final status
+    remains unchanged).
+
+    Returns the CURRENT status response with the actual ``cancel_requested``
+    state (#89). The previous implementation hardcoded ``cancel_requested=True``
+    even when the request was a no-op (unknown/finished job), which lied to the
+    client. We re-read the job AFTER the cancel request so a terminal transition
+    that raced with the POST is visible to the caller.
+    """
+    job = job_repo.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    was_requested = job_manager.request_cancel(job_id)
+    if not was_requested:
+        # No in-memory flag — the job is unknown to the manager (finished,
+        # cancelled, or the server restarted). Surface the truth rather than
+        # pretending the cancel took effect.
+        logger.info(
+            "Cancel requested for job %s with no active in-memory flag (likely already terminal or server-restarted)",
+            job_id,
+        )
+
+    # Re-read the job so the response reflects any terminal transition that
+    # raced with the cancel request (e.g. the worker just finished between
+    # the first GET and this POST).
+    job = job_repo.get(job_id)
+    return _to_status_response(
+        job,
+        cancel_requested=job_manager.is_cancel_requested(job_id),
+    )
+
+
+# --- GET /api/jobs/{id}/result ------------------------------------------------
+
+
+@router.get("/{job_id}/result", response_model=JobResultResponse)
+async def get_job_result(
+    job_id: str,
+    job_repo: Annotated[JobRepository, Depends()],
+    result_repo: Annotated[ResultRepository, Depends()],
+) -> JobResultResponse:
+    """Fetch a job's assembled result envelope.
+
+    Returns:
+    * ``result``: the assembled envelope built from the job's ``result_records[]``
+      (module-specific structure per ``contracts/result-rendering.md``)
+    * ``records[]``: raw persisted result records (with ``seq``, ``rank``, ``config``,
+      ``summary``, ``tables``) for advanced inspection
+    * ``form_schema``: the pinned form-schema snapshot used to submit this job
+      (deterministic re-render)
+
+    Raises 404 if unknown job_id.
+    """
+    # 1. Fetch the job
+    job = job_repo.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    # 2. Fetch result records
+    raw_records = result_repo.list_for_job(job_id)
+    records = [
+        {
+            "seq": r.seq,
+            "rank": r.rank,
+            "config": r.config,
+            "summary": r.summary,
+            "tables": r.tables,
+            "case_hash": r.case_hash,
+        }
+        for r in raw_records
+    ]
+
+    # 3. Fetch the pinned form schema snapshot
+    schema_registry = SchemaRegistry()
+    form_schema = schema_registry.get_form_schema(job.module_id, job.form_schema_version)
+    if form_schema is None:
+        # Fallback: return empty schema if snapshot missing (shouldn't happen)
+        logger.warning(f"Form schema snapshot missing for {job.module_id}:{job.form_schema_version}")
+        form_schema = {}
+
+    # 4. Assemble the result envelope
+    result = assemble_result_envelope(
+        module_id=job.module_id,
+        records=records,
+        form_schema_version=job.form_schema_version,
+        input_config=job.params,
+        job_id=job.id,
+    )
+
+    return JobResultResponse(
+        job_id=job.id,
+        module_id=job.module_id,
+        form_schema=form_schema,
+        records=records,
+        result=result,
+    )

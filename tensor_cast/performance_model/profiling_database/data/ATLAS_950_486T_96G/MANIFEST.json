@@ -1,0 +1,50 @@
+{
+  "device": "ATLAS_950_486T_96G",
+  "status": "TEMPLATE_NOT_MEASURED",
+  "generated_at": "2026-11-13",
+  "cloned_from": "ATLAS_800_A3_752T_128G_DIE/vllm_ascend/vllm0.23.0rc1_torch2.10.0_cann9.0.1 + hccl/v9.0.1",
+  "software_stack": {
+    "vllm_ascend": "0.23.0rc1",
+    "pytorch": "2.10.0",
+    "cann": "9.0.1",
+    "op_plugin": "7.4.0"
+  },
+  "compute_csv_count": 79,
+  "shape_rows_preserved": 19359,
+  "hccl_csv_count": 4,
+  "latency_policy": "all measured columns = 0; pending start_microbench.py / generate_comm_microbench.py",
+  "device_profile_in_repo": {
+    "memory_size_GB": 96,
+    "memory_bandwidth_TBps": 4.0,
+    "bf16_compute_TFLOPS": 432,
+    "comm_grid": "POD_1K [16, 8, 8]",
+    "tier_bandwidth_GBps": {
+      "0": 224,
+      "1": 448,
+      "2": 840
+    }
+  },
+  "public_spec_reference": {
+    "note": "Public specs only. NOT measurements, NOT written into any CSV.",
+    "Ascend_950PR": "128GB / 1.6TB/s / FP8 1 PFLOPS / MXFP4 2 PFLOPS",
+    "Ascend_950DT": "144GB / 4TB/s / HiZQ 2.0",
+    "interconnect": "Lingqu 2.0, up to 2TB/s bidirectional",
+    "caveat": "Do not match repo profile (96GB/4TB/s/486T); never use them to scale latency."
+  },
+  "public_kernel_anchor": {
+    "note": "Single published data point, different stack. Reference only, NOT in CSV.",
+    "source": "DeepGEMM Ascend on 950DT / CANN 9.20",
+    "shape": "BF16 M=4096 N=7168 K=16384",
+    "duration_us": 2229.9,
+    "tflops": 431
+  },
+  "prohibited_use": [
+    "Do not report simulation results from this DB as measured performance.",
+    "Do not use this DB to compare or rank deployment strategies.",
+    "Do not publish / merge into the released database before real collection."
+  ],
+  "next_steps": [
+    "bash collect_atlas950.sh on a Linux host with CANN + msprof + NPU",
+    "verify hit rate via text_generate --performance-model profiling --profiling-database-path <DB> --export-empirical-metrics-file <report>"
+  ]
+}

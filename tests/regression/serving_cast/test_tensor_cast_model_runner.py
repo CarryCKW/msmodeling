@@ -1,0 +1,1460 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2025-2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import multiprocessing as mp
+import tempfile
+import threading
+import unittest
+from dataclasses import dataclass
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import numpy as np
+import pytest
+from serving_cast import stime
+from serving_cast.config import Config, ParallelConfig
+from serving_cast.model_runner import (
+    AsyncTask,
+    AsyncTaskManager,
+    CompletionEventManager,
+    InterpolationPoint,
+    ModelRunner,
+    ModelRunnerMetricCacheManager,
+)
+from serving_cast.request import Request, RequestState
+from tensor_cast.core.input_generator import RequestInfo
+from tensor_cast.core.model_runner import ModelRunner as TensorCastModelRunner
+from tensor_cast.core.model_runner import ModelRunnerMetrics
+from tensor_cast.core.quantization.datatypes import QuantizeAttentionAction, QuantizeLinearAction
+from tensor_cast.core.user_config import UserInputConfig
+
+
+@dataclass
+class MockParsedArgs:
+    """Mock parsed args for Config initialization."""
+
+    instance_config_path: str
+    common_config_path: str
+    enable_profiling: bool = False
+
+
+def create_test_config_files():
+    """Create temporary config files for testing."""
+    import os
+
+    import yaml
+
+    tmp_dir = tempfile.mkdtemp()
+
+    common_config = {
+        "model_config": {
+            "name": "Qwen/Qwen3-32B",
+            "enable_multi_process": False,
+            "enable_interpolate": False,
+        },
+        "load_gen": {
+            "load_gen_type": "poisson",
+            "num_requests": 10,
+            "num_input_tokens": 100,
+            "num_output_tokens": 50,
+            "request_rate": 1.0,
+        },
+        "serving_config": {
+            "max_concurrency": 100,
+            "block_size": 128,
+            "max_tokens_budget": 8192,
+        },
+    }
+
+    instance_config = {
+        "instance_groups": [
+            {
+                "num_instances": 1,
+                "num_devices_per_instance": 1,
+                "pd_role": "both",
+                "parallel_config": {
+                    "world_size": 1,
+                    "tp_size": 1,
+                },
+            }
+        ]
+    }
+
+    common_path = os.path.join(tmp_dir, "common.yaml")
+    instance_path = os.path.join(tmp_dir, "instances.yaml")
+
+    with open(common_path, "w", encoding="utf-8") as f:
+        yaml.dump(common_config, f)
+    with open(instance_path, "w", encoding="utf-8") as f:
+        yaml.dump(instance_config, f)
+
+    return tmp_dir, common_path, instance_path
+
+
+class TestTensorCastModelRunner(unittest.TestCase):
+    def test_init_valid_device(self):
+        runner = TensorCastModelRunner(
+            UserInputConfig(
+                device="TEST_DEVICE",
+                model_id="Qwen/Qwen3-32B",
+                world_size=1,
+                tp_size=1,
+            )
+        )
+        self.assertIsNotNone(runner.model)
+        self.assertEqual(runner.model.model_config.parallel_config.world_size, 1)
+        self.assertEqual(runner.model.model_config.parallel_config.tensor_parallel_size, 1)
+        self.assertIsNotNone(runner.model.model_config.quant_config)
+
+    def test_init_invalid_device(self):
+        with self.assertRaises(ValueError):
+            TensorCastModelRunner(
+                UserInputConfig(
+                    device="invalid-device",
+                    model_id="test-model",
+                    world_size=1,
+                    tp_size=1,
+                )
+            )
+
+    def test_run_inference_basic(self):
+        mock_requests: list[RequestInfo] = [
+            RequestInfo(query_len=10, seq_len=10, is_decode=False),
+            RequestInfo(query_len=1, seq_len=10, is_decode=True),
+        ]
+
+        runner = TensorCastModelRunner(
+            UserInputConfig(
+                device="TEST_DEVICE",
+                model_id="Qwen/Qwen3-32B",
+            )
+        )
+
+        metrics = runner.run_inference(mock_requests)
+        self.assertIsNotNone(metrics)
+
+    def test_run_inference_with_ep(self):
+        model_runner = TensorCastModelRunner(
+            UserInputConfig(
+                device="TEST_DEVICE",
+                model_id="deepseek-ai/DeepSeek-V3.1",
+                quantize_linear_action=QuantizeLinearAction.FP8,
+                quantize_attention_action=QuantizeAttentionAction.INT8,
+                world_size=8,
+                tp_size=8,
+                dp_size=1,
+                ep_size=8,
+            )
+        )
+        requests = [RequestInfo(1, 65, True)]
+        metrics = model_runner.run_inference(requests)
+        self.assertIsNotNone(metrics)
+
+    def test_check_peak_memory_usage_gb_scales_heterogeneous_prefill_batch(self):
+        runner = TensorCastModelRunner.__new__(TensorCastModelRunner)
+        runner.model_weight_size_gb = 40.0
+        runner.total_device_memory_gb = 64.0
+        runner.user_input = UserInputConfig(
+            device="TEST_DEVICE",
+            model_id="Qwen/Qwen3-32B",
+            reserved_memory_gb=10.0,
+        )
+
+        peak_memory_usage_gb = runner._check_peak_memory_usage_gb(
+            peak_memory_usage_gb=80.0,
+            kv_cache_size_gb=5.0,
+            requests=[
+                RequestInfo(query_len=250, seq_len=250, is_decode=False),
+                RequestInfo(query_len=1000, seq_len=1000, is_decode=False),
+            ],
+        )
+
+        self.assertEqual(peak_memory_usage_gb, 48.5)
+
+    def test_check_peak_memory_usage_gb_keeps_homogeneous_prefill_batch(self):
+        runner = TensorCastModelRunner.__new__(TensorCastModelRunner)
+        runner.model_weight_size_gb = 40.0
+        runner.total_device_memory_gb = 64.0
+        runner.user_input = UserInputConfig(
+            device="TEST_DEVICE",
+            model_id="Qwen/Qwen3-32B",
+            reserved_memory_gb=10.0,
+        )
+
+        peak_memory_usage_gb = runner._check_peak_memory_usage_gb(
+            peak_memory_usage_gb=80.0,
+            kv_cache_size_gb=5.0,
+            requests=[
+                RequestInfo(query_len=250, seq_len=250, is_decode=False),
+                RequestInfo(query_len=250, seq_len=250, is_decode=False),
+            ],
+        )
+
+        self.assertEqual(peak_memory_usage_gb, 80.0)
+
+    def test_check_peak_memory_usage_gb_clamps_negative_activation_for_heterogeneous_prefill_batch(self):
+        runner = TensorCastModelRunner.__new__(TensorCastModelRunner)
+        runner.model_weight_size_gb = 40.0
+        runner.total_device_memory_gb = 50.0
+        runner.user_input = UserInputConfig(
+            device="TEST_DEVICE",
+            model_id="Qwen/Qwen3-32B",
+            reserved_memory_gb=10.0,
+        )
+
+        peak_memory_usage_gb = runner._check_peak_memory_usage_gb(
+            peak_memory_usage_gb=42.0,
+            kv_cache_size_gb=5.0,
+            requests=[
+                RequestInfo(query_len=250, seq_len=250, is_decode=False),
+                RequestInfo(query_len=1000, seq_len=1000, is_decode=False),
+            ],
+        )
+
+        self.assertEqual(peak_memory_usage_gb, 45.0)
+
+
+class TestInterpolationPoint(unittest.TestCase):
+    """Tests for InterpolationPoint dataclass."""
+
+    def test_interpolation_point_creation(self):
+        """Test InterpolationPoint dataclass creation."""
+        point = InterpolationPoint(total_seq_len=100, total_query_len=50)
+        self.assertEqual(point.total_seq_len, 100)
+        self.assertEqual(point.total_query_len, 50)
+
+    def test_interpolation_point_equality(self):
+        """Test InterpolationPoint equality."""
+        point1 = InterpolationPoint(total_seq_len=100, total_query_len=50)
+        point2 = InterpolationPoint(total_seq_len=100, total_query_len=50)
+        point3 = InterpolationPoint(total_seq_len=200, total_query_len=50)
+        self.assertEqual(point1, point2)
+        self.assertNotEqual(point1, point3)
+
+
+class TestInterpolationBatchGeneration(unittest.TestCase):
+    def test_generate_random_batches_clamps_negative_capacity(self):
+        runner = ModelRunner.__new__(ModelRunner)
+        common_config = SimpleNamespace(
+            serving_config=SimpleNamespace(max_concurrency=10, block_size=128, max_tokens_budget=512),
+            load_gen=SimpleNamespace(num_input_tokens=100, num_output_tokens=50),
+        )
+
+        with (
+            patch(
+                "serving_cast.model_runner.Config.get_instance",
+                return_value=SimpleNamespace(common_config=common_config),
+            ),
+            patch.object(runner, "warmup", return_value=(-22, 128)),
+        ):
+            batches = runner.generate_random_batches()
+
+        self.assertTrue(batches)
+        self.assertTrue(all(request.query_len > 0 and request.seq_len > 0 for batch in batches for request in batch))
+        self.assertEqual(batches[-1][0].query_len, 100)
+
+    def test_generate_random_batches_covers_near_cap_mixed_batches(self):
+        """Decode concurrency cap must shrink with the current prefill count.
+
+        Regression for the max_nums_prefill_req typo: with
+        upper_batch_size=100 and max_nums_prefill_req=3, the (1 prefill,
+        99 decode) near-cap mixed batch was never sampled.
+        """
+        runner = ModelRunner.__new__(ModelRunner)
+        common_config = SimpleNamespace(
+            serving_config=SimpleNamespace(max_concurrency=100, block_size=128, max_tokens_budget=8192),
+            load_gen=SimpleNamespace(num_input_tokens=3500, num_output_tokens=50),
+        )
+
+        with (
+            patch(
+                "serving_cast.model_runner.Config.get_instance",
+                return_value=SimpleNamespace(common_config=common_config),
+            ),
+            patch.object(runner, "warmup", return_value=(2800, 128)),
+        ):
+            batches = runner.generate_random_batches()
+
+        # upper_batch_size = min(2800 // 28, 100) = 100; max_nums_prefill_req =
+        # min(100, ceil(8192/3500)) = 3.
+        counts = {(sum(not r.is_decode for r in batch), sum(r.is_decode for r in batch)) for batch in batches}
+        self.assertIn((1, 99), counts)
+        # every sampled mixed batch must respect the batch capacity limit
+        self.assertTrue(all(p + d <= 100 for p, d in counts))
+
+
+class TestAsyncTask(unittest.TestCase):
+    """Tests for AsyncTask class."""
+
+    def test_async_task_creation(self):
+        """Test AsyncTask creation."""
+        batch = [
+            RequestInfo(query_len=10, seq_len=10, is_decode=False),
+            RequestInfo(query_len=1, seq_len=20, is_decode=True),
+        ]
+        task = AsyncTask(batch)
+        self.assertEqual(task.batch, batch)
+        self.assertIsNotNone(task.hash_value)
+
+    def test_async_task_hash_consistency(self):
+        """Test that same batch produces same hash."""
+        batch = [
+            RequestInfo(query_len=10, seq_len=10, is_decode=False),
+        ]
+        task1 = AsyncTask(batch)
+        task2 = AsyncTask(batch)
+        self.assertEqual(task1.hash_value, task2.hash_value)
+
+    def test_async_task_hash_different(self):
+        """Test that different batches produce different hashes."""
+        batch1 = [RequestInfo(query_len=10, seq_len=10, is_decode=False)]
+        batch2 = [RequestInfo(query_len=20, seq_len=20, is_decode=False)]
+        task1 = AsyncTask(batch1)
+        task2 = AsyncTask(batch2)
+        self.assertNotEqual(task1.hash_value, task2.hash_value)
+
+    def test_async_task_get_hash(self):
+        """Test get_hash method."""
+        batch = [RequestInfo(query_len=10, seq_len=100, is_decode=False)]
+        task = AsyncTask(batch)
+        hash_value = task.get_hash()
+        self.assertEqual(hash_value, task.hash_value)
+
+
+class TestModelRunnerStaticMethods(unittest.TestCase):
+    """Tests for ModelRunner static methods."""
+
+    def test_get_interpolation_point(self):
+        """Test get_interpolation_point static method."""
+        batch = [
+            RequestInfo(query_len=10, seq_len=100, is_decode=False),
+            RequestInfo(query_len=1, seq_len=50, is_decode=True),
+        ]
+        point = ModelRunner.get_interpolation_point(batch)
+        self.assertEqual(point.total_seq_len, 150)  # 100 + 50
+        self.assertEqual(point.total_query_len, 11)  # 10 + 1
+
+    def test_get_interpolation_point_empty(self):
+        """Test get_interpolation_point with empty batch."""
+        batch = []
+        point = ModelRunner.get_interpolation_point(batch)
+        self.assertEqual(point.total_seq_len, 0)
+        self.assertEqual(point.total_query_len, 0)
+
+    def test_get_interpolation_point_single(self):
+        """Test get_interpolation_point with single request."""
+        batch = [RequestInfo(query_len=100, seq_len=500, is_decode=False)]
+        point = ModelRunner.get_interpolation_point(batch)
+        self.assertEqual(point.total_seq_len, 500)
+        self.assertEqual(point.total_query_len, 100)
+
+    def test_predict_next_batch_prefill(self):
+        """Test predict_next_batch for mid-prefill (chunked) request.
+
+        seq_len already includes the current chunk's query (BatchScheduler
+        applies seq_len += num_computed_tokens before process_batch), so the
+        next chunk is the remaining prefill tokens with the sequence grown
+        accordingly. Regression: the old formula kept seq_len unchanged and
+        derived query_len from the current query, so predicted hashes never
+        matched the real next chunk for multi-chunk prefills.
+        """
+        current_batch = [
+            RequestInfo(
+                query_len=2048,  # chunk 1 just computed
+                seq_len=2048,  # includes chunk 1
+                num_input_tokens=3500,
+                num_output_tokens=8,
+                is_decode=False,
+            )
+        ]
+        future_batch = ModelRunner.predict_next_batch(current_batch)
+        self.assertEqual(len(future_batch), 1)
+        # remaining prefill = 3500 - 2048 = 1452; next seq = 2048 + 1452 = 3500
+        self.assertEqual(future_batch[0].query_len, 1452)
+        self.assertEqual(future_batch[0].seq_len, 3500)
+        self.assertFalse(future_batch[0].is_decode)
+
+    def test_predict_next_batch_prefill_clamped_by_budget(self):
+        """Remaining prefill beyond the token budget must clamp to the budget.
+
+        Real scheduling caps each chunk at max_tokens_budget, so a 3+ chunk
+        prefill predicts a budget-sized next chunk, not the whole remainder.
+        """
+        current_batch = [
+            RequestInfo(
+                query_len=2048,
+                seq_len=2048,
+                num_input_tokens=6000,
+                num_output_tokens=8,
+                is_decode=False,
+            )
+        ]
+        future_batch = ModelRunner.predict_next_batch(current_batch, max_query_len=2048)
+        self.assertEqual(future_batch[0].query_len, 2048)
+        self.assertEqual(future_batch[0].seq_len, 4096)
+
+    def test_predict_next_batch_multi_step_chunked_prefill_matches_schedule(self):
+        """Multi-step prediction for chunked prefill must track the real schedule.
+
+        Mirrors the reported repro (input 3500 > budget 2048): after chunk 1
+        the predicted chain must be (1452, 3500) then the decode step
+        (1, 3501) — exactly the batches the scheduler really runs next.
+        """
+        current_batch = [
+            RequestInfo(
+                query_len=2048,
+                seq_len=2048,
+                num_input_tokens=3500,
+                num_output_tokens=8,
+                is_decode=False,
+            )
+        ]
+        step2 = ModelRunner.predict_next_batch(current_batch, max_query_len=2048)
+        self.assertEqual((step2[0].query_len, step2[0].seq_len), (1452, 3500))
+        step3 = ModelRunner.predict_next_batch(step2, max_query_len=2048)
+        # prefill complete -> next step is decode
+        self.assertEqual((step3[0].query_len, step3[0].seq_len, step3[0].is_decode), (1, 3501, True))
+
+    def test_predict_next_batch_decode(self):
+        """Test predict_next_batch for decode request."""
+        current_batch = [
+            RequestInfo(
+                query_len=1,
+                seq_len=100,  # seq_len >= num_input_tokens but < num_input_tokens + num_output_tokens - 1
+                num_input_tokens=100,
+                num_output_tokens=50,
+                is_decode=True,
+            )
+        ]
+        future_batch = ModelRunner.predict_next_batch(current_batch)
+        self.assertEqual(len(future_batch), 1)
+        # Future should be decode
+        self.assertEqual(future_batch[0].query_len, 1)
+        self.assertEqual(future_batch[0].seq_len, 101)
+        self.assertTrue(future_batch[0].is_decode)
+
+    def test_predict_next_batch_finished(self):
+        """Test predict_next_batch for finished request."""
+        current_batch = [
+            RequestInfo(
+                query_len=1,
+                seq_len=149,  # seq_len == num_input_tokens + num_output_tokens - 1
+                num_input_tokens=100,
+                num_output_tokens=50,
+                is_decode=True,
+            )
+        ]
+        future_batch = ModelRunner.predict_next_batch(current_batch)
+        # Should be empty as request is finished
+        self.assertEqual(len(future_batch), 0)
+
+    def test_predict_next_batch_invalid_seq_len(self):
+        """Test predict_next_batch with invalid seq_len raises error."""
+        current_batch = [
+            RequestInfo(
+                query_len=1,
+                seq_len=200,  # seq_len > num_input_tokens + num_output_tokens - 1
+                num_input_tokens=100,
+                num_output_tokens=50,
+                is_decode=True,
+            )
+        ]
+        with self.assertRaises(ValueError):
+            ModelRunner.predict_next_batch(current_batch)
+
+    def test_predict_next_batch_multiple_requests(self):
+        """Test predict_next_batch with multiple requests."""
+        current_batch = [
+            RequestInfo(
+                query_len=10,
+                seq_len=5,
+                num_input_tokens=100,
+                num_output_tokens=50,
+                is_decode=False,
+            ),
+            RequestInfo(
+                query_len=1,
+                seq_len=120,
+                num_input_tokens=100,
+                num_output_tokens=50,
+                is_decode=True,
+            ),
+        ]
+        future_batch = ModelRunner.predict_next_batch(current_batch)
+        self.assertEqual(len(future_batch), 2)
+
+    def test_request2info_prefill(self):
+        """Test request2info with prefill request."""
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.PREFILLING
+        request.query_len = 10
+        request.seq_len = 10
+
+        request_infos = ModelRunner.request2info([request])
+        self.assertEqual(len(request_infos), 1)
+        self.assertEqual(request_infos[0].query_len, 10)
+        self.assertEqual(request_infos[0].seq_len, 10)
+        self.assertFalse(request_infos[0].is_decode)
+
+    def test_request2info_decode(self):
+        """Test request2info with decode request."""
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.DECODING
+        request.query_len = 1
+        request.seq_len = 150
+
+        request_infos = ModelRunner.request2info([request])
+        self.assertEqual(len(request_infos), 1)
+        self.assertEqual(request_infos[0].query_len, 1)
+        self.assertEqual(request_infos[0].seq_len, 150)
+        self.assertTrue(request_infos[0].is_decode)
+
+    def test_request2info_recomputation(self):
+        """Test request2info with recomputation request."""
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.RECOMPUTATION
+        request.query_len = 10
+        request.seq_len = 10
+
+        request_infos = ModelRunner.request2info([request])
+        self.assertEqual(len(request_infos), 1)
+        self.assertFalse(request_infos[0].is_decode)
+
+    def test_request2info_invalid_state(self):
+        """Test request2info with invalid state raises error."""
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.INITIAL
+        request.query_len = 10
+        request.seq_len = 10
+
+        with self.assertRaises(ValueError):
+            ModelRunner.request2info([request])
+
+    def test_request2info_query_gt_seq(self):
+        """Test request2info with query_len > seq_len raises error."""
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.PREFILLING
+        request.query_len = 20
+        request.seq_len = 10  # query_len > seq_len
+
+        with self.assertRaises(ValueError):
+            ModelRunner.request2info([request])
+
+    def test_request2info_multiple_requests(self):
+        """Test request2info with multiple requests."""
+        request1 = Request(num_input_tokens=100, num_output_tokens=50)
+        request1.state = RequestState.PREFILLING
+        request1.query_len = 10
+        request1.seq_len = 10
+
+        request2 = Request(num_input_tokens=200, num_output_tokens=100)
+        request2.state = RequestState.DECODING
+        request2.query_len = 1
+        request2.seq_len = 250
+
+        request_infos = ModelRunner.request2info([request1, request2])
+        self.assertEqual(len(request_infos), 2)
+
+    @staticmethod
+    def _process_runner(num_mtp_tokens):
+        runner = object.__new__(ModelRunner)
+        runner.common_config = SimpleNamespace(
+            model_config=SimpleNamespace(name="test-model", num_mtp_tokens=num_mtp_tokens)
+        )
+        runner.enable_multi_process = False
+        runner._get_estimated_time = Mock(side_effect=[1.0, 2.0])
+        return runner
+
+    def test_process_batch_splits_mixed_mtp_batch_serially(self):
+        """Mixed MTP batches use serial homogeneous latency estimates."""
+        stime.init_simulation()
+        runner = self._process_runner(num_mtp_tokens=2)
+        prefill = Request(num_input_tokens=10, num_output_tokens=5)
+        prefill.state = RequestState.PREFILLING
+        prefill.query_len = 10
+        prefill.seq_len = 10
+        decode = Request(num_input_tokens=10, num_output_tokens=5)
+        decode.state = RequestState.DECODING
+        decode.query_len = 3
+        decode.seq_len = 13
+
+        with patch("serving_cast.model_runner.stime.Duration") as duration:
+            runner.process_batch([decode, prefill])
+
+        self.assertEqual(runner._get_estimated_time.call_count, 2)
+        prefill_batch = runner._get_estimated_time.call_args_list[0].args[0]
+        decode_batch = runner._get_estimated_time.call_args_list[1].args[0]
+        self.assertEqual([(request.is_decode, request.query_len) for request in prefill_batch], [(False, 10)])
+        self.assertEqual([(request.is_decode, request.query_len) for request in decode_batch], [(True, 3)])
+        duration.assert_called_once_with(3.0)
+
+    def test_process_batch_does_not_split_homogeneous_or_non_mtp_batches(self):
+        prefill = Request(num_input_tokens=10, num_output_tokens=5)
+        prefill.state = RequestState.PREFILLING
+        prefill.query_len = 10
+        prefill.seq_len = 10
+        decode = Request(num_input_tokens=10, num_output_tokens=5)
+        decode.state = RequestState.DECODING
+        decode.query_len = 3
+        decode.seq_len = 13
+
+        for num_mtp_tokens, batch in ((2, [prefill]), (2, [decode]), (0, [prefill, decode])):
+            with self.subTest(num_mtp_tokens=num_mtp_tokens, states=[request.state.name for request in batch]):
+                stime.init_simulation()
+                runner = self._process_runner(num_mtp_tokens)
+
+                runner.process_batch(batch)
+
+                runner._get_estimated_time.assert_called_once()
+
+    def test_get_interpolation_model_basic(self):
+        """Test get_interpolation_model static method."""
+        # Create non-collinear test data (triangular points)
+        x = np.array([[0, 0], [1, 0], [0, 1]])
+        y = np.array([1.0, 2.0, 3.0])
+
+        model = ModelRunner.get_interpolation_model(x, y)
+        # Test prediction at center of triangle
+        result = model([0.33, 0.33])
+        self.assertIsNotNone(result)
+
+    def test_get_interpolation_model_invalid_x_shape(self):
+        """Test get_interpolation_model with invalid x shape."""
+        x = np.array([1, 2, 3])  # 1D instead of 2D
+        y = np.array([1.0, 2.0, 3.0])
+
+        with self.assertRaises(ValueError):
+            ModelRunner.get_interpolation_model(x, y)
+
+    def test_get_interpolation_model_invalid_y_shape(self):
+        """Test get_interpolation_model with invalid y shape."""
+        x = np.array([[1, 1], [2, 2], [3, 3]])
+        y = np.array([[1.0], [2.0], [3.0]])  # 2D instead of 1D
+
+        with self.assertRaises(ValueError):
+            ModelRunner.get_interpolation_model(x, y)
+
+    def test_get_interpolation_model_mismatched_lengths(self):
+        """Test get_interpolation_model with mismatched lengths."""
+        x = np.array([[1, 1], [2, 2], [3, 3]])
+        y = np.array([1.0, 2.0])  # Only 2 values
+
+        with self.assertRaises(ValueError):
+            ModelRunner.get_interpolation_model(x, y)
+
+    def test_get_interpolation_model_multiple_points(self):
+        """Test get_interpolation_model predict function with multiple points."""
+        # Use rectangular grid points (non-collinear)
+        x = np.array([[0, 0], [1, 0], [0, 1], [1, 1]])
+        y = np.array([1.0, 2.0, 3.0, 4.0])
+
+        model = ModelRunner.get_interpolation_model(x, y)
+        # Test with multiple points
+        result = model([[0.5, 0.5], [0.5, 0.5]])
+        self.assertEqual(len(result), 2)
+
+    def test_get_interpolation_model_single_point_invalid(self):
+        """Test get_interpolation_model predict with invalid single point."""
+        # Use triangular points (non-collinear)
+        x = np.array([[0, 0], [1, 0], [0, 1]])
+        y = np.array([1.0, 2.0, 3.0])
+
+        model = ModelRunner.get_interpolation_model(x, y)
+        # Single point with wrong length
+        with self.assertRaises(ValueError):
+            model([1, 2, 3])  # 3 values instead of 2
+
+    def test_get_interpolation_model_multiple_points_invalid_shape(self):
+        """Test get_interpolation_model predict with invalid multiple points shape."""
+        # Use triangular points (non-collinear)
+        x = np.array([[0, 0], [1, 0], [0, 1]])
+        y = np.array([1.0, 2.0, 3.0])
+
+        model = ModelRunner.get_interpolation_model(x, y)
+        # Multiple points with wrong shape
+        with self.assertRaises(ValueError):
+            model([[1, 2, 3], [4, 5, 6]])  # 3 columns instead of 2
+
+
+class TestModelRunnerMetricCacheManager(unittest.TestCase):
+    """Tests for ModelRunnerMetricCacheManager class."""
+
+    def setUp(self):
+        """Set up test fixtures with real multiprocessing Manager."""
+        self.manager = mp.Manager()
+
+    def tearDown(self):
+        """Clean up multiprocessing Manager."""
+        self.manager.shutdown()
+
+    def test_init_cache_slot(self):
+        """Test init_cache_slot method."""
+        cache_manager = ModelRunnerMetricCacheManager(self.manager)
+        cache_manager.init_cache_slot("test_id")
+        self.assertIn("test_id", cache_manager.cache)
+
+    def test_init_cache_slot_duplicate(self):
+        """Test init_cache_slot with duplicate cache_id raises error."""
+        cache_manager = ModelRunnerMetricCacheManager(self.manager)
+        cache_manager.init_cache_slot("test_id")
+        with self.assertRaises(ValueError):
+            cache_manager.init_cache_slot("test_id")
+
+    def test_get_cache(self):
+        """Test get_cache method."""
+        cache_manager = ModelRunnerMetricCacheManager(self.manager)
+        cache_manager.init_cache_slot("test_id")
+        cache_manager.cache["test_id"] = "test_value"
+        result = cache_manager.get_cache("test_id")
+        self.assertEqual(result, "test_value")
+
+    def test_get_cache_not_found(self):
+        """Test get_cache with non-existent cache_id raises error."""
+        cache_manager = ModelRunnerMetricCacheManager(self.manager)
+        with self.assertRaises(KeyError):
+            cache_manager.get_cache("non_existent")
+
+    def _create_test_metrics(self):
+        """Helper to create a valid ModelRunnerMetrics instance for testing."""
+        return ModelRunnerMetrics(
+            total_device_memory_gb=80.0,
+            model_weight_size_gb=15.0,
+            peak_memory_usage_gb=50.0,
+            kv_cache_size_gb=5.0,
+            kv_cache_per_token_gb=0.001,
+            model_activation_size_gb=10.0,
+            reserved_memory_gb=0.0,
+            device_memory_available_gb=10.0,
+            execution_time_s={"analytic": 0.5},
+            tps_per_model={"analytic": 100.0},
+            run_time_s=1.0,
+            batch_size=1,
+        )
+
+    def test_record_cache(self):
+        """Test record_cache method."""
+        cache_manager = ModelRunnerMetricCacheManager(self.manager)
+        cache_manager.init_cache_slot("test_id")
+        test_metrics = self._create_test_metrics()
+        cache_manager.record_cache("test_id", test_metrics)
+        self.assertEqual(cache_manager.cache["test_id"], test_metrics)
+
+    def test_record_cache_not_found(self):
+        """Test record_cache with non-existent cache_id raises error."""
+        cache_manager = ModelRunnerMetricCacheManager(self.manager)
+        test_metrics = self._create_test_metrics()
+        with self.assertRaises(KeyError):
+            cache_manager.record_cache("non_existent", test_metrics)
+
+    def test_cache_round_trip(self):
+        """Test storing and retrieving metrics."""
+        cache_manager = ModelRunnerMetricCacheManager(self.manager)
+        cache_manager.init_cache_slot("metrics_id")
+        original_metrics = ModelRunnerMetrics(
+            total_device_memory_gb=80.0,
+            model_weight_size_gb=15.0,
+            peak_memory_usage_gb=50.0,
+            kv_cache_size_gb=20.0,
+            kv_cache_per_token_gb=0.0005,
+            model_activation_size_gb=10.0,
+            reserved_memory_gb=0.0,
+            device_memory_available_gb=80.0,
+            execution_time_s={"analytic": 1.23, "empirical": 1.45},
+            tps_per_model={"analytic": 100.0},
+            run_time_s=2.0,
+            batch_size=2,
+        )
+        cache_manager.record_cache("metrics_id", original_metrics)
+        retrieved = cache_manager.get_cache("metrics_id")
+        self.assertEqual(retrieved.execution_time_s["analytic"], 1.23)
+        self.assertEqual(retrieved.device_memory_available_gb, 80.0)
+
+
+class TestCompletionEventManager(unittest.TestCase):
+    """Tests for CompletionEventManager class."""
+
+    def setUp(self):
+        """Set up test fixtures with real multiprocessing Manager."""
+        self.manager = mp.Manager()
+
+    def tearDown(self):
+        """Clean up multiprocessing Manager."""
+        self.manager.shutdown()
+
+    def test_init_event_slot(self):
+        """Test init_event_slot method."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("test_event")
+        self.assertIn("test_event", event_manager.event_dict)
+        # Clean up
+        event_manager.shutdown()
+
+    def test_init_event_slot_duplicate(self):
+        """Test init_event_slot with duplicate event_id raises error."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("test_event")
+        with self.assertRaises(ValueError):
+            event_manager.init_event_slot("test_event")
+        # Clean up
+        event_manager.shutdown()
+
+    def test_set_completion_event(self):
+        """Test set_completion_event method."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("test_event")
+        event_manager.set_completion_event("test_event")
+        # Wait briefly for the background thread to process
+        import time
+
+        time.sleep(0.5)
+        self.assertTrue(event_manager.event_dict["test_event"].is_set())
+        # Clean up
+        event_manager.shutdown()
+
+    def test_wait_completion_event(self):
+        """Test wait_completion_event method."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("test_event")
+
+        # Set event in a separate thread
+        def set_event():
+            import time
+
+            time.sleep(0.1)
+            event_manager.set_completion_event("test_event")
+
+        setter_thread = threading.Thread(target=set_event)
+        setter_thread.start()
+
+        # Wait should return after event is set
+        event_manager.wait_completion_event("test_event")
+        self.assertTrue(event_manager.event_dict["test_event"].is_set())
+
+        setter_thread.join()
+        # Clean up
+        event_manager.shutdown()
+
+    def test_shutdown(self):
+        """Test shutdown method."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("test_event")
+        event_manager.shutdown()
+        self.assertFalse(event_manager._thread_running)
+
+    def test_shutdown_with_empty_queue(self):
+        """Test shutdown with empty queue."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.shutdown()
+        self.assertFalse(event_manager._thread_running)
+
+    def test_shutdown_clears_event_dict(self):
+        """Test that shutdown clears the event dictionary."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("event1")
+        event_manager.init_event_slot("event2")
+        event_manager.shutdown()
+        self.assertEqual(len(event_manager.event_dict), 0)
+
+    def test_multiple_events(self):
+        """Test handling multiple events."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("event1")
+        event_manager.init_event_slot("event2")
+
+        event_manager.set_completion_event("event1")
+        event_manager.set_completion_event("event2")
+
+        import time
+
+        time.sleep(0.5)
+
+        self.assertTrue(event_manager.event_dict["event1"].is_set())
+        self.assertTrue(event_manager.event_dict["event2"].is_set())
+
+        event_manager.shutdown()
+
+
+class TestCompletionEventManagerThread(unittest.TestCase):
+    """Tests for CompletionEventManager background thread behavior."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.manager = mp.Manager()
+
+    def tearDown(self):
+        """Clean up."""
+        self.manager.shutdown()
+
+    def test_thread_running_after_init(self):
+        """Test that background thread is running after initialization."""
+        event_manager = CompletionEventManager(self.manager)
+        self.assertTrue(event_manager._thread_running)
+        self.assertTrue(event_manager._event_thread.is_alive())
+        event_manager.shutdown()
+
+    def test_thread_stops_after_shutdown(self):
+        """Test that background thread stops after shutdown."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.shutdown()
+        # Give thread time to stop
+        event_manager._event_thread.join(timeout=2)
+        self.assertFalse(event_manager._event_thread.is_alive())
+
+
+class TestProcessCompletionQueue(unittest.TestCase):
+    """Tests for _process_completion_queue edge cases."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.manager = mp.Manager()
+
+    def tearDown(self):
+        """Clean up."""
+        self.manager.shutdown()
+
+    def test_process_queue_with_none_event_id(self):
+        """Test that None event_id is skipped in queue processing."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("real_event")
+
+        # Put None in the queue - should be skipped
+        event_manager.completion_queue.put(None)
+        import time
+
+        time.sleep(0.5)
+
+        # The real event should not be set
+        self.assertFalse(event_manager.event_dict["real_event"].is_set())
+
+        event_manager.shutdown()
+
+    def test_process_queue_sets_event(self):
+        """Test that event is set when processing queue."""
+        event_manager = CompletionEventManager(self.manager)
+        event_manager.init_event_slot("test_event")
+
+        # Put event_id in queue
+        event_manager.completion_queue.put("test_event")
+
+        import time
+
+        time.sleep(0.5)
+
+        # Event should be set
+        self.assertTrue(event_manager.event_dict["test_event"].is_set())
+
+        event_manager.shutdown()
+
+    def test_process_queue_unknown_event_raises(self):
+        """Test that unknown event_id raises ValueError."""
+        event_manager = CompletionEventManager(self.manager)
+
+        # Put unknown event_id in queue
+        event_manager.completion_queue.put("unknown_event")
+
+        import time
+
+        time.sleep(1)
+
+        # The thread should still be running (error was caught)
+        # or stopped due to error
+        event_manager.shutdown()
+
+
+class TestAsyncTaskManager(unittest.TestCase):
+    """Tests for AsyncTaskManager class."""
+
+    @staticmethod
+    def _noop():
+        # picklable no-op target for spawn-safe dummy worker processes
+        pass
+
+    def test_add_task(self):
+        """Test add_task method."""
+        batch = [RequestInfo(query_len=10, seq_len=100, is_decode=False)]
+        task = AsyncTask(batch)
+
+        manager = mp.Manager()
+        task_queue = manager.Queue()
+        cache_manager = ModelRunnerMetricCacheManager(manager)
+        event_manager = CompletionEventManager(manager)
+
+        # Manually simulate add_task behavior
+        task_hash = task.hash_value
+        cache_manager.init_cache_slot(task_hash)
+        event_manager.init_event_slot(task_hash)
+        task_queue.put(task)
+
+        # Verify cache slot was created
+        self.assertIn(task_hash, cache_manager.cache)
+        # Verify event slot was created
+        self.assertIn(task_hash, event_manager.event_dict)
+
+        event_manager.shutdown()
+        manager.shutdown()
+
+    def test_worker_error_marker_wakes_waiter_and_records_cause(self):
+        """Worker failure reported via the completion queue must set the event.
+
+        Regression for the runtime hang: a worker task exception used to kill
+        the worker silently while the main process blocked forever on
+        wait_completion_event. Now the worker puts an error marker that the
+        completion thread turns into a set event plus a recorded root cause.
+        """
+        from serving_cast.model_runner import _WORKER_ERROR_MARKER
+
+        manager = mp.Manager()
+        event_manager = CompletionEventManager(manager)
+        task_hash = "fake-task-hash"
+        event_manager.init_event_slot(task_hash)
+
+        event_manager.completion_queue.put((_WORKER_ERROR_MARKER, task_hash, "ValueError: boom"))
+
+        # must return (not hang) once the completion thread processes the marker
+        event_manager.wait_completion_event(task_hash)
+        self.assertIn(task_hash, event_manager.worker_errors)
+        self.assertEqual(event_manager.worker_errors[task_hash], "ValueError: boom")
+
+        event_manager.shutdown()
+        manager.shutdown()
+
+    def test_wait_completion_event_raises_when_all_workers_dead(self):
+        """Silent worker death (no marker) must raise instead of blocking."""
+        manager = mp.Manager()
+        event_manager = CompletionEventManager(manager)
+        task_hash = "fake-task-hash"
+        event_manager.init_event_slot(task_hash)
+
+        dead_worker = mp.Process(target=TestAsyncTaskManager._noop)
+        dead_worker.start()
+        dead_worker.join(timeout=10)
+        event_manager.workers = [dead_worker]
+        # shorten the poll interval so the test fails fast
+        event_manager._WAIT_POLL_INTERVAL_S = 0.1
+
+        with self.assertRaisesRegex(RuntimeError, "workers died"):
+            event_manager.wait_completion_event(task_hash)
+
+        event_manager.shutdown()
+        manager.shutdown()
+
+    def test_find_result_raises_on_worker_error(self):
+        """find_result must surface the worker's root cause as a clear error."""
+        from serving_cast.model_runner import AsyncTaskManager as _ATM
+
+        manager = mp.Manager()
+        event_manager = CompletionEventManager(manager)
+        cache_manager = ModelRunnerMetricCacheManager(manager)
+
+        batch = [RequestInfo(query_len=10, seq_len=100, is_decode=False)]
+        task = AsyncTask(batch)
+        task_hash = task.hash_value
+        cache_manager.init_cache_slot(task_hash)
+        event_manager.init_event_slot(task_hash)
+        event_manager.worker_errors[task_hash] = "RuntimeError: worker boom"
+        event_manager.event_dict[task_hash].set()
+
+        task_manager = _ATM.__new__(_ATM)
+        task_manager.task_record = {task_hash}
+        task_manager.event_manager = event_manager
+        task_manager.model_runner_metrics_cache_manager = cache_manager
+
+        with self.assertRaisesRegex(RuntimeError, "worker boom"):
+            task_manager.find_result(batch)
+
+        event_manager.shutdown()
+        manager.shutdown()
+
+
+class TestModelRunnerIntegration(unittest.TestCase):
+    """Integration tests for ModelRunner with Config."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up Config for ModelRunner tests."""
+        cls.tmp_dir, cls.common_path, cls.instance_path = create_test_config_files()
+        Config._instance = None
+        Config._initialized = False
+        cls.config = Config(
+            MockParsedArgs(
+                instance_config_path=cls.instance_path,
+                common_config_path=cls.common_path,
+            )
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up temp files."""
+        import shutil
+
+        Config._instance = None
+        Config._initialized = False
+        shutil.rmtree(cls.tmp_dir, ignore_errors=True)
+
+    def test_init_tensor_cast_model_runner(self):
+        """Test init_tensor_cast_model_runner static method."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner.init_tensor_cast_model_runner(self.config.common_config, parallel_config, "TEST_DEVICE")
+        self.assertIsNotNone(runner)
+
+    def test_model_runner_init(self):
+        """Test ModelRunner initialization."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+        self.assertIsNotNone(runner.tensor_cast_model_runner)
+        self.assertFalse(runner.enable_multi_process)
+        runner.shutdown()
+
+    def test_model_runner_get_kv_cache_num_bytes(self):
+        """Test get_kv_cache_num_bytes method.
+
+        CommunicationManager.device2device_async rejects non-int byte counts, so the
+        PD disaggregation KV transfer path breaks unless a positive int is returned.
+        """
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+        num_bytes = runner.get_kv_cache_num_bytes(100)
+        self.assertIsInstance(num_bytes, int)
+        self.assertGreater(num_bytes, 0)
+        runner.shutdown()
+
+    def test_model_runner_get_inputs_num_bytes(self):
+        """Test get_inputs_num_bytes method."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.PREFILLING
+        request.query_len = 10
+        request.seq_len = 10
+
+        num_bytes = runner.get_inputs_num_bytes([request])
+        self.assertIsInstance(num_bytes, int)
+        runner.shutdown()
+
+    def test_model_runner_process_batch(self):
+        """Test process_batch method."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.PREFILLING
+        request.query_len = 10
+        request.seq_len = 10
+
+        runner.process_batch([request])
+        runner.shutdown()
+
+    def test_model_runner_warmup(self):
+        """Test warmup method."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+
+        num_blocks, block_size = runner.warmup()
+        self.assertIsInstance(num_blocks, int)
+        self.assertIsInstance(block_size, int)
+        runner.shutdown()
+
+    def test_warmup_scales_num_blocks_by_dcp_capacity_factor(self):
+        """warmup() multiplies num_blocks by the DCP token-capacity factor.
+
+        DCP shards the KV cache along the token dimension, so the same per-card
+        byte budget can hold more tokens (how many is layout-dependent; see
+        ``dcp_kv_token_capacity_factor``). ``run_inference`` is stubbed so only the
+        warmup arithmetic is exercised: a factor of 2 must exactly double num_blocks
+        relative to a factor of 1.
+        """
+        from unittest.mock import patch
+
+        parallel_config = ParallelConfig(world_size=1, tp_size=1, moe_dp_size=1)
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+
+        def _fake_metrics(factor):
+            return ModelRunnerMetrics(
+                total_device_memory_gb=80.0,
+                model_weight_size_gb=0.0,
+                peak_memory_usage_gb=0.0,
+                kv_cache_size_gb=0.0,
+                kv_cache_per_token_gb=0.001,
+                kv_cache_token_capacity_factor=factor,
+                model_activation_size_gb=0.0,
+                reserved_memory_gb=0.0,
+                device_memory_available_gb=40.0,
+                execution_time_s={"analytic": 0.3},
+                tps_per_model={"analytic": 100.0},
+                run_time_s=1.0,
+                batch_size=1,
+            )
+
+        with patch.object(runner.tensor_cast_model_runner, "run_inference", return_value=_fake_metrics(1)):
+            blocks_dcp1, _ = runner.warmup()
+        with patch.object(runner.tensor_cast_model_runner, "run_inference", return_value=_fake_metrics(2)):
+            blocks_dcp2, _ = runner.warmup()
+
+        self.assertGreater(blocks_dcp1, 0)
+        self.assertEqual(blocks_dcp2, blocks_dcp1 * 2)
+        runner.shutdown()
+
+    def test_apply_interpolation_model_not_ready(self):
+        """Test apply_interpolation_model raises when not ready."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+        runner._interpolation_ready = False
+        runner._interpolation_model = None
+
+        batch = [RequestInfo(query_len=10, seq_len=100, is_decode=False)]
+        with self.assertRaises(ValueError):
+            runner.apply_interpolation_model(batch)
+        runner.shutdown()
+
+    def test_apply_interpolation_model_with_model(self):
+        """Test apply_interpolation_model with a real interpolation model."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+
+        # Manually set up the interpolation model
+        x = np.array([[0, 0], [1000, 0], [0, 1000], [1000, 1000]])
+        y = np.array([0.1, 0.5, 0.3, 0.8])
+        runner._interpolation_model = ModelRunner.get_interpolation_model(x, y)
+        runner._interpolation_ready = True
+
+        batch = [RequestInfo(query_len=100, seq_len=500, is_decode=False)]
+        result = runner.apply_interpolation_model(batch)
+        self.assertIsInstance(result, float)
+        runner.shutdown()
+
+
+@pytest.mark.nightly
+class TestModelRunnerWithInterpolation(unittest.TestCase):
+    """Tests for ModelRunner with interpolation enabled."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up Config with enable_interpolate=True."""
+        import os
+
+        import yaml
+
+        tmp_dir = tempfile.mkdtemp()
+
+        common_config = {
+            "model_config": {
+                "name": "Qwen/Qwen3-32B",
+                "enable_multi_process": False,
+                "enable_interpolate": True,
+                "interpolation_seed": 42,
+            },
+            "load_gen": {
+                "load_gen_type": "poisson",
+                "num_requests": 10,
+                "num_input_tokens": 100,
+                "num_output_tokens": 50,
+                "request_rate": 1.0,
+            },
+            "serving_config": {
+                "max_concurrency": 10,
+                "block_size": 128,
+                "max_tokens_budget": 512,
+            },
+        }
+
+        instance_config = {
+            "instance_groups": [
+                {
+                    "num_instances": 1,
+                    "num_devices_per_instance": 1,
+                    "pd_role": "both",
+                    "parallel_config": {
+                        "world_size": 1,
+                        "tp_size": 1,
+                    },
+                }
+            ]
+        }
+
+        common_path = os.path.join(tmp_dir, "common.yaml")
+        instance_path = os.path.join(tmp_dir, "instances.yaml")
+
+        with open(common_path, "w", encoding="utf-8") as f:
+            yaml.dump(common_config, f)
+        with open(instance_path, "w", encoding="utf-8") as f:
+            yaml.dump(instance_config, f)
+
+        cls.tmp_dir = tmp_dir
+        Config._instance = None
+        Config._initialized = False
+        cls.config = Config(
+            MockParsedArgs(
+                instance_config_path=instance_path,
+                common_config_path=common_path,
+            )
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up temp files."""
+        import shutil
+
+        Config._instance = None
+        Config._initialized = False
+        shutil.rmtree(cls.tmp_dir, ignore_errors=True)
+
+    def test_model_runner_init_with_interpolate(self):
+        """Test ModelRunner initialization with interpolation enabled."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+        self.assertTrue(runner.enable_interpolate)
+        self.assertTrue(runner._interpolation_ready)
+        self.assertIsNotNone(runner._interpolation_model)
+        runner.shutdown()
+
+    def test_model_runner_process_batch_with_interpolate(self):
+        """Test process_batch uses interpolation when enabled."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        runner = ModelRunner(parallel_config, "TEST_DEVICE", dp_rank=0)
+
+        request = Request(num_input_tokens=100, num_output_tokens=50)
+        request.state = RequestState.PREFILLING
+        request.query_len = 10
+        request.seq_len = 10
+
+        runner.process_batch([request])
+        runner.shutdown()
+
+
+class TestAsyncTaskManagerFull(unittest.TestCase):
+    """Tests for AsyncTaskManager actual initialization with Config."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up Config for AsyncTaskManager tests."""
+        cls.tmp_dir, cls.common_path, cls.instance_path = create_test_config_files()
+        Config._instance = None
+        Config._initialized = False
+        cls.config = Config(
+            MockParsedArgs(
+                instance_config_path=cls.instance_path,
+                common_config_path=cls.common_path,
+            )
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        """Clean up temp files."""
+        import shutil
+
+        Config._instance = None
+        Config._initialized = False
+        shutil.rmtree(cls.tmp_dir, ignore_errors=True)
+
+    def test_async_task_manager_init_and_shutdown(self):
+        """Test AsyncTaskManager initialization and shutdown."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        task_manager = AsyncTaskManager(
+            device_type="TEST_DEVICE",
+            parallel_config=parallel_config,
+            num_workers=2,
+        )
+        self.assertIsNotNone(task_manager.workers)
+        self.assertEqual(len(task_manager.workers), 2)
+        task_manager.shutdown()
+        self.assertEqual(len(task_manager.workers), 0)
+
+    def test_async_task_manager_add_task(self):
+        """Test AsyncTaskManager add_task method."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        task_manager = AsyncTaskManager(
+            device_type="TEST_DEVICE",
+            parallel_config=parallel_config,
+            num_workers=2,
+        )
+        batch = [RequestInfo(query_len=10, seq_len=100, is_decode=False)]
+        task_manager.add_task(batch)
+        task_hash = AsyncTask(batch).hash_value
+        self.assertIn(task_hash, task_manager.task_record)
+
+        # Adding same task again should not duplicate
+        task_manager.add_task(batch)
+        task_manager.shutdown()
+
+    def test_async_task_manager_find_result_not_in_record(self):
+        """Test AsyncTaskManager find_result with task not in record."""
+        parallel_config = ParallelConfig(
+            world_size=1,
+            tp_size=1,
+            moe_dp_size=1,
+        )
+        task_manager = AsyncTaskManager(
+            device_type="TEST_DEVICE",
+            parallel_config=parallel_config,
+            num_workers=2,
+        )
+        batch = [RequestInfo(query_len=10, seq_len=100, is_decode=False)]
+        result = task_manager.find_result(batch)
+        self.assertIsNone(result)
+        task_manager.shutdown()
+
+
+if __name__ == "__main__":
+    unittest.main()

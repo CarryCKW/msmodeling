@@ -1,0 +1,45 @@
+# Git 元数据与本地环境
+.git
+.gitignore
+.gitattributes
+.gitmodules
+.venv
+venv
+env
+.uv-cache
+*.egg-info
+
+# Python 缓存与构建产物
+**/__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+dist/
+build/
+
+# IDE / 系统
+.idea
+.vscode
+.DS_Store
+*.swp
+
+# 大体积 profiling 数据（由 Git LFS 管理，镜像不需要；运行时挂载）
+tensor_cast/performance_model/profiling_database/data
+docs/perf_database/forward_pass_traces
+models
+results
+
+# 本地文档、汇报与非运行资产
+*.md
+!README.md
+docs
+spec
+tests
+*.xlsx
+gitleaks
+
+# 采集原始 profiling 产物
+PROF_*
+hccl_bench_data

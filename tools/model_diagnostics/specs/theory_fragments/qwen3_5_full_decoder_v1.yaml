@@ -1,0 +1,58 @@
+fragment_id: qwen3_5_full_decoder_v1
+fragment_kind: model_decoder
+include_fragments:
+  - qwen3_attention_v1
+  - {fragment: qwen3_dense_ffn_v1, activation: qwen3_5_dense_ffn}
+  - {fragment: qwen3_moe_ffn_v1, activation: qwen3_5_moe_ffn}
+runtime_options:
+  attention_qkv:
+    ignored_operator_groups: [norm_math_with_add, sigmoid_scaffold, cat_split, quantization, dtype_cast, shape_views, tensor_storage, broadcast_shapes]
+  attention:
+    ignored_operator_groups: [norm_math_with_add, quantization, dtype_cast, tensor_storage]
+    ignored_operators:
+      - sigmoid
+  dense_ffn:
+    boundary_operators:
+    - rms_norm
+    - rms_norm_dynamic_quant_symmetric
+    - rms_norm_quant
+    ignored_operator_groups: [norm_math, sigmoid_scaffold, cat_split, collective_communication, quantization, dtype_cast, layout_permute, shape_views, tensor_storage, broadcast_shapes]
+    ignored_operators:
+      - index
+  moe_gate:
+    boundary_operators:
+    - add_rms_norm2
+    - add_rms_norm_dynamic_quant2_symmetric
+    - add_rms_norm_quant2
+    - rms_norm
+    ignored_operator_groups: [norm_math, sigmoid_scaffold, cat_split, quantization, dtype_cast, layout_permute, shape_views, tensor_storage, broadcast_shapes]
+    ignored_operators:
+      - index
+  moe_dispatch:
+    ignored_operator_groups: [quantization, dtype_cast, tensor_storage, broadcast_shapes]
+    ignored_operators:
+      - index
+      - mul
+      - neg
+      - constant_pad_nd
+  moe_experts:
+    boundary_operators:
+    - grouped_matmul_swiglu
+    - grouped_matmul_quant_swiglu
+    - grouped_matmul_quant_int4_swiglu
+    - grouped_matmul_fp8_swiglu
+    - grouped_matmul_mxfp4_swiglu
+    - mm
+    - static_quant_linear
+    - static_quant_linear_int4
+    - fp8_linear
+    - mxfp4_linear
+    ignored_operators:
+    - constant_pad_nd
+  moe_combine:
+    ignored_operator_groups: [sigmoid_scaffold, cat_split, quantization, dtype_cast, layout_permute, tensor_storage, broadcast_shapes]
+    ignored_operators:
+      - mean
+      - pow
+      - rsqrt
+      - index

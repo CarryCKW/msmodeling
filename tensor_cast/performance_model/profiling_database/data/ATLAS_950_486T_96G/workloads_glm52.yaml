@@ -1,0 +1,19 @@
+
+workloads:
+  - name: glm52_atlas950_pd_4096_1024
+    model: zai-org/GLM-5.2
+    device: ATLAS_950_486T_96G
+    num_devices: 16
+    input_length: 4096
+    output_length: 1024
+    max_batched_tokens: 8192        # 与部署脚本 P 侧 --max-num-batched-tokens 对齐
+    batch_range: [4, 32]
+    tp_sizes: [1, 2, 4, 8, 16]
+    ep_sizes: [16]
+    disagg: true
+    ttft_limit: 2000
+    tpot_limit: 80
+    num_mtp_tokens: [3]
+    mtp_acceptance_rates: [0.9, 0.6, 0.4]
+    quantize_linear_action: MXFP4
+    quantize_attention_action: FP8

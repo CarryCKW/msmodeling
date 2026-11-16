@@ -1,0 +1,105 @@
+# Qwen3-VL MoE text decoder fragment for the HF native Runtime path captured by
+# model_diagnostics. It intentionally does not reuse qwen3_moe_decoder_v1:
+# Qwen3-VL MoE emits decomposed RMSNorm, independent q/k/v projections, and
+# per-local-expert static_quant_linear calls instead of fused grouped_matmul.
+fragment_id: qwen3_vl_moe_decoder_v1
+fragment_kind: model_decoder
+include_fragments:
+  - qwen3_vl_moe_attention_v1
+stages:
+  - id: moe_gate
+    modules:
+      - name: moe_gate_linear
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, E]", dtype: ACT}
+      - name: topk
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, Ktop]", dtype: float32}
+          OUTPUT[1]: {shape: "[Tmoe, Ktop]", dtype: int64}
+    runtime:
+      # Match the complete pre-FFN RMSNorm sequence, not one of its casts.
+      boundary_operators: [rms_norm]
+      ignored_operator_groups: [norm_math_with_add, slice_select, quantization, dtype_cast, layout_permute, shape_views, tensor_storage]
+      ignored_operators:
+        - _softmax
+        - sum
+        - div_
+        - all_gather
+  - id: moe_dispatch
+    modules:
+      - name: init_routing_v2
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe * Ktop, H]", dtype: ACT}
+    runtime:
+      boundary_operators: [init_routing_v2]
+      ignored_operator_groups: [slice_select, quantization, dtype_cast, layout_permute, shape_views, tensor_storage, cat_split]
+      ignored_operators:
+        - pad
+        - all_to_all
+  - id: moe_experts
+    # Empty per-expert slices return before gate/up/down projections, so only
+    # experts receiving at least one routed token emit runtime operators.
+    repeat: Eactive
+    modules:
+      - &expert_gate
+        name: expert_gate_projection
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, Fmoe]", dtype: OUT}
+      - &expert_up
+        name: expert_up_projection
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, Fmoe]", dtype: OUT}
+      - &expert_down
+        name: expert_down_projection
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, H]", dtype: OUT}
+    runtime:
+      boundary_operators: [static_quant_linear]
+      ignored_operator_groups: [layout_permute, slice_select, quantization, dtype_cast, shape_views, tensor_storage, cat_split]
+      ignored_operators:
+        - pad
+        - silu
+        - mul
+        - all_to_all
+  - id: moe_combine
+    modules:
+      - name: unpermute_tokens
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, Ktop, H]", dtype: ACT}
+      - name: mul
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, Ktop, H]", dtype: ACT}
+      - name: sum
+        tensors:
+          OUTPUT[0]: {shape: "[Tmoe, H]", dtype: ACT}
+    runtime:
+      boundary_operators: [unpermute_tokens]
+      ignored_operator_groups: [slice_select, rms_norm_kernels, dtype_cast, shape_views, tensor_storage]
+      ignored_operators:
+        - add
+        - all_to_all
+        - all_gather
+    comparisons:
+      theory-runtime:
+        # Final RMSNorm/request bookkeeping can share this Runtime window when
+        # MTP deactivates the ordinary output region. Compare the three HF MoE
+        # combine boundaries explicitly and leave the following framework
+        # mechanics outside this stage's semantic contract.
+        strategy: boundary_equal
+        options:
+          mapping:
+            mode: explicit
+            pairs:
+              - left_call_index: 0
+                left_slot: {direction: output, index: 0, name: null}
+                right_call_index: 0
+                right_slot: {direction: output, index: 0, name: null}
+              - left_call_index: 1
+                left_slot: {direction: output, index: 0, name: null}
+                right_call_index: 1
+                right_slot: {direction: output, index: 0, name: null}
+              - left_call_index: 2
+                left_slot: {direction: output, index: 0, name: null}
+                right_call_index: 2
+                right_slot: {direction: output, index: 0, name: null}
+            relations: []

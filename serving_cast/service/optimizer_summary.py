@@ -1,0 +1,1378 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2025-2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import logging
+from decimal import Decimal
+import math
+from typing import Optional
+
+import pandas as pd
+from prettytable import PrettyTable
+
+from serving_cast.service.utils import (
+    MEMORY_COLUMNS,
+    PREFILL_PHASE_MAKESPAN_COLUMN,
+    MemoryInfo,
+)
+from serving_cast.service.pipeline_schedule import PipelineScheduleEstimate
+from serving_cast.service.utils import ParallelSearchCandidate
+from serving_cast.utils import (
+    best_pd_row_per_group,
+    rank_pd_ratio_rows,
+    sort_pd_ratio_dict_rows,
+)
+
+logger = logging.getLogger(__name__)
+
+EARLY_STOP_MEMORY_OOM = "memory_oom"
+EARLY_STOP_PREFILL_OOM = "prefill_oom"
+EARLY_STOP_DECODE_OOM = "decode_oom"
+EARLY_STOP_TPOT_LIMIT = "tpot_limit"
+EARLY_STOP_TTFT_LIMIT = "ttft_limit"
+
+
+def _positive_float(value) -> Optional[float]:
+    num = pd.to_numeric(value, errors="coerce")
+    if num is None or pd.isna(num) or float(num) <= 0:
+        return None
+    return float(num)
+
+
+def _steady_pp_prefill_request_qps(row: pd.Series) -> Optional[float]:
+    """Steady-state request QPS for PP>1 prefill rows (Issue #543, review P1).
+
+    PP>1 prefill throughput is anchored on the steady wave interval
+    (``measured_interval_s``, PR !821), so request QPS derives from
+    ``token/s / input_length`` — the full-prompt token basis. The producer
+    keeps counting the complete prompt in the throughput numerator even with
+    prefix cache (``batch_size * dp * input_length``, see
+    ``disagg_throughput_optimizer.py`` and the regression
+    ``test_prefill_cached_prefix_keeps_full_seq_len_and_token_basis``):
+    ``effective_input_length`` is only the cache-miss compute length, so
+    dividing by it would over-state request QPS by
+    ``input_length / effective_input_length`` under prefix cache.
+    ``prefill_phase_makespan_ms`` on these rows is the wave-1 warm-up
+    diagnostic (it still contains the amortized pipeline cooldown), so using
+    it here would put QPS and token/s on different time bases. Returns
+    ``None`` for PP=1 rows and for rows missing either operand, letting
+    callers fall back to the phase-makespan formula instead of silently
+    mixing token bases.
+    """
+    if "pp_size" not in row.index:
+        return None
+    pp_size = pd.to_numeric(row.get("pp_size"), errors="coerce")
+    if pd.isna(pp_size) or int(pp_size) <= 1:
+        return None
+    token_s = _positive_float(row.get("token/s"))
+    input_length = _positive_float(row.get("input_length"))
+    if token_s is None or input_length is None:
+        return None
+    return token_s / input_length
+
+
+def _compute_disagg_request_qps(row: pd.Series, output_length: Optional[int]) -> Optional[float]:
+    """Per-phase request QPS for disaggregation summary rows.
+
+    Prefill uses ``concurrency / prefill_phase_makespan_ms * 1000`` when the
+    phase timing is available. Legacy rows without that field fall back to
+    ``concurrency / ttft * 1000``. PP>1 prefill rows instead use the
+    steady-state ``token/s / input_length`` (full-prompt token basis of the
+    throughput numerator; their ``prefill_phase_makespan_ms`` is the wave-1
+    warm-up diagnostic, see ``_steady_pp_prefill_request_qps`` and Issue
+    #543). Decode uses ``concurrency / (tpot * output_length) * 1000``.
+    Rows with both TTFT and TPOT valid (aggregation-style) return ``None``.
+    """
+    conc = _positive_float(row.get("concurrency"))
+    if conc is None:
+        return None
+    ttft = _positive_float(row.get("ttft"))
+    tpot = _positive_float(row.get("tpot"))
+
+    if ttft is not None and tpot is None:
+        if PREFILL_PHASE_MAKESPAN_COLUMN in row.index:
+            steady_qps = _steady_pp_prefill_request_qps(row)
+            if steady_qps is not None:
+                return steady_qps
+            prefill_makespan = _positive_float(row.get(PREFILL_PHASE_MAKESPAN_COLUMN))
+            if prefill_makespan is None:
+                return None
+            return conc / prefill_makespan * 1000.0
+        return conc / ttft * 1000.0
+    if tpot is not None and ttft is None:
+        if output_length is None or int(output_length) <= 0:
+            return None
+        return conc / (tpot * float(output_length)) * 1000.0
+    return None
+
+
+def compute_request_qps(token_s: float, output_length: int) -> float:
+    """Compute request QPS from token throughput and output length."""
+    return float(token_s) / float(output_length)
+
+
+TTFT_COLUMN = "TTFT (ms)"
+TPOT_COLUMN = "TPOT (ms)"
+THROUGHPUT_TIE_TOLERANCE = 1e-3
+THROUGHPUT_TIE_TOLERANCE_DECIMAL = Decimal("0.001")
+PP_RESULT_COLUMNS = (
+    "tp_size",
+    "pp_size",
+    "dp_size",
+    "ep_size",
+    "moe_dp_size",
+    "pp_layer_partition",
+    "pp_schedule",
+    "pp_makespan_ms",
+    "pp_warmup_ms",
+    "pp_steady_ms",
+    "pp_cooldown_ms",
+    "pp_bubble_ratio",
+    "pp_bottleneck_stage",
+    "pp_mixed_pd_overlap_approx",
+)
+SHOW_COLUMNS = [
+    "Top",
+    "\033[1mThroughput\033[0m (token/s)",
+    TTFT_COLUMN,
+    TPOT_COLUMN,
+    "concurrency",
+    "num_devices",
+    "parallel",
+    "batch_size",
+] + MEMORY_COLUMNS
+
+
+def _numeric_result_column(df: pd.DataFrame, column: str, default: float) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(default, index=df.index, dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").fillna(default)
+
+
+def rank_optimizer_result_rows(df: pd.DataFrame, data_config) -> pd.DataFrame:
+    """Deterministically rank final rows using anchored throughput groups."""
+    if df.empty:
+        return df.copy()
+
+    work = df.copy()
+    work["_throughput"] = _numeric_result_column(work, "token/s", float("-inf"))
+    parallel = work.get("parallel", pd.Series("", index=work.index))
+    work["_parallel_sort"] = parallel.fillna("").astype(str)
+    work["_row_stable_id"] = work.apply(
+        lambda row: "|".join(f"{column}={row[column]!r}" for column in df.columns),
+        axis=1,
+    )
+    ordered = work.sort_values(
+        ["_throughput", "_parallel_sort", "_row_stable_id"],
+        ascending=[False, True, True],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    slo_metrics = []
+    for column, limit in (
+        ("ttft", getattr(data_config, "ttft_limits", None)),
+        ("tpot", getattr(data_config, "tpot_limits", None)),
+    ):
+        if column not in ordered.columns:
+            continue
+        metric = _numeric_result_column(ordered, column, float("nan"))
+        slo_metrics.append(metric / limit if limit and limit > 0 else metric)
+    ordered["_slo_metric"] = pd.concat(slo_metrics, axis=1).max(axis=1).fillna(0.0) if slo_metrics else 0.0
+    ordered["_bubble_sort"] = _numeric_result_column(ordered, "pp_bubble_ratio", float("inf"))
+    memory = pd.Series(float("nan"), index=ordered.index, dtype=float)
+    for column in ("avail_GB", "device_memory_available_gb", "memory_left_gb"):
+        memory = memory.combine_first(_numeric_result_column(ordered, column, float("nan")))
+    ordered["_memory_sort"] = memory.fillna(float("-inf"))
+    ordered["_pp_size_sort"] = _numeric_result_column(ordered, "pp_size", 1.0)
+    ordered["_batch_size_sort"] = _numeric_result_column(ordered, "batch_size", float("inf"))
+    ordered["_concurrency_sort"] = _numeric_result_column(ordered, "concurrency", float("inf"))
+
+    ranked_groups = []
+    start = 0
+    while start < len(ordered):
+        anchor = ordered.iloc[start]["_throughput"]
+        end = start + 1
+        while end < len(ordered):
+            candidate = ordered.iloc[end]["_throughput"]
+            if math.isfinite(anchor) and math.isfinite(candidate):
+                same_group = Decimal(str(anchor)) - Decimal(str(candidate)) <= THROUGHPUT_TIE_TOLERANCE_DECIMAL
+            else:
+                same_group = anchor == candidate
+            if not same_group:
+                break
+            end += 1
+        ranked_groups.append(
+            ordered.iloc[start:end].sort_values(
+                [
+                    "_slo_metric",
+                    "_bubble_sort",
+                    "_memory_sort",
+                    "_pp_size_sort",
+                    "_batch_size_sort",
+                    "_concurrency_sort",
+                    "_parallel_sort",
+                    "_row_stable_id",
+                ],
+                ascending=[True, True, False, True, True, True, True, True],
+                kind="mergesort",
+            )
+        )
+        start = end
+
+    return pd.concat(ranked_groups, ignore_index=True)[df.columns]
+
+
+def select_parallel_result_rows(df: pd.DataFrame, data_config) -> pd.DataFrame:
+    """Select one independently ranked representative for every parallel label."""
+    if df.empty:
+        return df.copy()
+    representatives = []
+    for _, parallel_df in df.groupby("parallel", sort=False, dropna=False):
+        representatives.append(rank_optimizer_result_rows(parallel_df, data_config).head(1))
+    return pd.concat(representatives, ignore_index=True)
+
+
+def _fmt_optional(value, fmt: str = "{:.2f}") -> str:
+    return fmt.format(value) if value is not None else "-"
+
+
+def _fmt_memory_info(memory_info: Optional[MemoryInfo], key: str) -> str:
+    val = pd.to_numeric(memory_info.get(key), errors="coerce") if memory_info else None
+    if val is None or pd.isna(val):
+        return "-"
+    return f"{float(val):.3f} GB"
+
+
+def _sorted_rows(rows: list[dict], metric: str) -> list[dict]:
+    return sorted(rows, key=lambda row: row.get(metric, 0.0), reverse=True)
+
+
+class OptimizerSummary:
+    def __init__(self, data_config):
+        self._early_stop_flag = None
+        self._early_stop_reason = None
+        self._summary_df = None
+        self._memory_info: MemoryInfo | None = None
+        self.data_config = data_config
+        self._search_info = None
+        # PP>1 aggregation uses a coarse prefill/decode overlap approximation;
+        # Task 5 surfaces this as a result column. Task 4 stores the flag here.
+        self._pp_mixed_pd_overlap_approx = False
+
+    def set_pp_mixed_pd_overlap_approx(self, value: bool) -> None:
+        """Mark that this aggregation result used the coarse P/D overlap approx."""
+        self._pp_mixed_pd_overlap_approx = bool(value)
+
+    def get_pp_mixed_pd_overlap_approx(self) -> bool:
+        return self._pp_mixed_pd_overlap_approx
+
+    def set_summary_df(self, summary_df):
+        self._summary_df = self._add_pp_result_columns(summary_df)
+
+    def _add_pp_result_columns(self, summary_df):
+        """Attach typed PP metadata while a result row still has its context."""
+        if summary_df is None or set(PP_RESULT_COLUMNS).issubset(summary_df.columns):
+            return summary_df
+
+        candidate = getattr(self.data_config, "parallel_search_candidate", None)
+        if not isinstance(candidate, ParallelSearchCandidate):
+            # PP=1 legacy path: attach default PP columns only when the DataFrame
+            # looks like an optimizer result (has "parallel" column), so that
+            # simple unit tests using arbitrary DataFrames are not modified.
+            if "parallel" not in summary_df.columns:
+                return summary_df
+            result_df = summary_df.copy()
+            defaults = {
+                "tp_size": getattr(self.data_config, "tp_size", None),
+                "pp_size": 1,
+                "dp_size": getattr(self.data_config, "dp_size", None),
+                "ep_size": getattr(self.data_config, "ep_size", None),
+                "moe_dp_size": getattr(self.data_config, "moe_dp_size", None),
+                "pp_layer_partition": None,
+                "pp_schedule": "forward",
+                "pp_makespan_ms": None,
+                "pp_warmup_ms": None,
+                "pp_steady_ms": None,
+                "pp_cooldown_ms": None,
+                "pp_bubble_ratio": 0.0,
+                "pp_bottleneck_stage": None,
+                "pp_mixed_pd_overlap_approx": self._pp_mixed_pd_overlap_approx,
+            }
+            for column, value in defaults.items():
+                if column == "pp_layer_partition":
+                    result_df[column] = [value] * len(result_df)
+                else:
+                    result_df[column] = value
+            return result_df
+
+        result_df = summary_df.copy()
+        estimate = getattr(self.data_config, "pipeline_schedule_estimate", None)
+        schedule = estimate if isinstance(estimate, PipelineScheduleEstimate) else None
+        values = {
+            "tp_size": candidate.tp_size,
+            "pp_size": candidate.pp_size,
+            "dp_size": candidate.dp_size,
+            "ep_size": candidate.ep_size,
+            "moe_dp_size": candidate.moe_dp_size,
+            "pp_layer_partition": candidate.layer_partition,
+            "pp_schedule": candidate.schedule,
+            "pp_makespan_ms": schedule.makespan_s * 1000.0 if schedule else None,
+            "pp_warmup_ms": schedule.warmup_s * 1000.0 if schedule else None,
+            "pp_steady_ms": schedule.steady_s * 1000.0 if schedule else None,
+            "pp_cooldown_ms": schedule.cooldown_s * 1000.0 if schedule else None,
+            "pp_bubble_ratio": (
+                schedule.bubble_ratio if schedule is not None else 0.0 if candidate.pp_size == 1 else None
+            ),
+            "pp_bottleneck_stage": (schedule.bottleneck_stage_id if schedule is not None else None),
+            "pp_mixed_pd_overlap_approx": self._pp_mixed_pd_overlap_approx,
+        }
+        for column, value in values.items():
+            if column == "pp_layer_partition":
+                result_df[column] = [value] * len(result_df)
+            else:
+                result_df[column] = value
+        return result_df
+
+    def get_summary_df(self):
+        return self._summary_df
+
+    def set_search_info(self, search_info: dict):
+        self._search_info = search_info
+
+    def get_search_info(self) -> dict:
+        return self._search_info
+
+    def set_memory_info(self, memory_info: MemoryInfo):
+        """Set memory breakdown info for reporting.
+
+        Args:
+            memory_info: dict with keys like total_device_memory_gb,
+                model_weight_size_gb, kv_cache_size_gb, model_activation_size_gb,
+                reserved_memory_gb, device_memory_available_gb.
+        """
+        self._memory_info = memory_info
+
+    def get_memory_info(self) -> MemoryInfo | None:
+        return self._memory_info
+
+    def set_early_stop_flag(self, memory_left, tpot, ttft, reason: str | None = None):
+        def check(value, limit):
+            return value is not None and limit is not None and value > limit
+
+        if memory_left < 0:
+            self._early_stop_reason = reason or EARLY_STOP_MEMORY_OOM
+        elif check(tpot, self.data_config.tpot_limits):
+            self._early_stop_reason = EARLY_STOP_TPOT_LIMIT
+        elif check(ttft, self.data_config.ttft_limits):
+            self._early_stop_reason = EARLY_STOP_TTFT_LIMIT
+        else:
+            self._early_stop_reason = None
+
+        self._early_stop_flag = self._early_stop_reason is not None
+
+    def check_early_stop_flag(self):
+        return self._early_stop_flag
+
+    def get_early_stop_reason(self) -> str | None:
+        return self._early_stop_reason
+
+    def _is_pd_ratio_mode(self):
+        """Return whether this is PD ratio optimization mode."""
+        return (
+            hasattr(self.data_config, "prefill_devices_per_instance")
+            and self.data_config.prefill_devices_per_instance is not None
+            and hasattr(self.data_config, "decode_devices_per_instance")
+            and self.data_config.decode_devices_per_instance is not None
+        )
+
+    def report_final_result(self, args, silent: bool = False):
+        if silent:
+            return
+        if self._summary_df is None or self._summary_df.empty:
+            logger.warning("Summary DataFrame is empty or unset. Please set it first.")
+            return
+
+        if self._is_pd_ratio_mode():
+            # Apply PD ratio filtering for both dump and normal output
+            filtered_df = self._prepare_pd_ratio_results()
+            if args.dump_original_results:
+                if filtered_df.empty:
+                    logger.info("No results after PD ratio filtering.")
+                else:
+                    print("\n" + filtered_df.to_string(index=False) + "\n")
+            else:
+                final_out = self._get_pd_ratio_final_out(args, filtered_df)
+                print("\n" + "\n".join(final_out))
+        elif args.dump_original_results:
+            print("\n" + self._summary_df.to_string(index=False) + "\n")
+        else:
+            final_out = self._get_agg_disagg_final_out(args)
+            print("\n" + "\n".join(final_out))
+
+    def _prepare_agg_disagg_results(self):
+        """Prepare and filter results for aggregation/disaggregation mode."""
+        tpot_limit = self.data_config.tpot_limits or float("inf")
+        ttft_limit = self.data_config.ttft_limits or float("inf")
+
+        mask = (pd.to_numeric(self._summary_df["tpot"], errors="coerce").fillna(float("inf")) <= tpot_limit) & (
+            pd.to_numeric(self._summary_df["ttft"], errors="coerce").fillna(float("inf")) <= ttft_limit
+        )
+
+        representatives = select_parallel_result_rows(self._summary_df[mask], self.data_config)
+        return self._rank_agg_disagg_rows(representatives).reset_index(drop=True)
+
+    def _rank_agg_disagg_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        return rank_optimizer_result_rows(df, self.data_config)
+
+    def get_best_result_row(self) -> Optional[pd.Series]:
+        """Return the raw best row after mode-specific filtering and ranking."""
+        if self._summary_df is None or self._summary_df.empty:
+            return None
+
+        prepared = self._prepare_pd_ratio_results() if self._is_pd_ratio_mode() else self._prepare_agg_disagg_results()
+        return None if prepared.empty else prepared.iloc[0]
+
+    def _get_agg_disagg_final_out(self, args):
+        if isinstance(args.input_length, str):
+            return self._get_agg_disagg_final_out_batched(args)
+
+        sorted_summary_df = self._prepare_agg_disagg_results()
+        if sorted_summary_df.empty:
+            logger.warning("No optimizer rows passed TTFT/TPOT filters; cannot pick best configuration.")
+            return [
+                "*" * 80,
+                "No configurations satisfy the current TTFT/TPOT filters.",
+                "*" * 80,
+            ]
+
+        best_result = sorted_summary_df.loc[0]
+
+        final_out = []
+        final_out.append("*" * 80)
+
+        final_out.append("  " + "-" * 76)
+        final_out.append("  Input Configuration: ")
+        final_out.append(f"    Model: {args.model_id}")
+        final_out.append(f"    Quantize Linear action: {args.quantize_linear_action}")
+        final_out.append(f"    Quantize Attention action: {args.quantize_attention_action}")
+        final_out.append(f"    Devices: {args.num_devices} {args.device}")
+        final_out.append(f"    TTFT Limits: {self.data_config.ttft_limits} ms")
+        final_out.append(f"    TPOT Limits: {self.data_config.tpot_limits} ms")
+        final_out.append("  " + "-" * 76)
+
+        # Memory Info (constant fields; per-row fields are in the table)
+        mem = self._memory_info
+        if mem:
+            final_out.append("  Memory Info: ")
+            final_out.append(f"    Total device memory:  {_fmt_memory_info(mem, 'total_device_memory_gb')}")
+            final_out.append(f"    Reserved memory:      {_fmt_memory_info(mem, 'reserved_memory_gb')}")
+            final_out.append("  " + "-" * 76)
+
+        final_out.append("  Overall Best Configuration: ")
+        final_out.append(f"    Best Throughput: {best_result['token/s']:.2f} tokens/s")
+        if best_result["ttft"] is not None:
+            final_out.append(f"    TTFT: {best_result['ttft']:.2f} ms")
+        if best_result["tpot"] is not None:
+            final_out.append(f"    TPOT: {best_result['tpot']:.2f} ms")
+        final_out.append("  " + "-" * 76)
+
+        table_buf = (
+            _get_disagg_table_buf(sorted_summary_df, self.data_config.output_length)
+            if args.disagg
+            else _get_agg_table_buf(sorted_summary_df)
+        )
+        final_out.append(table_buf)
+        final_out.append("*" * 80)
+
+        return final_out
+
+    def collect_comparison_row(self, device_label: str) -> Optional[dict]:
+        """Pick the best aggregation/disaggregation row for cross-hardware comparison."""
+        return self._best_agg_disagg_row(device_label)
+
+    def collect_disagg_prefill_row(self, device_label: str) -> Optional[dict]:
+        """Best Prefill row from a disaggregation Prefill-phase summary (cross-hardware)."""
+        if self.data_config.ttft_limits is None or self.data_config.tpot_limits is not None:
+            return None
+        return self._best_agg_disagg_row(device_label)
+
+    def collect_disagg_decode_row(self, device_label: str) -> Optional[dict]:
+        """Best Decode row from a disaggregation Decode-phase summary (cross-hardware)."""
+        if self.data_config.tpot_limits is None or self.data_config.ttft_limits is not None:
+            return None
+        return self._best_agg_disagg_row(device_label)
+
+    def _best_agg_disagg_row(self, device_label: str) -> Optional[dict]:
+        if self._is_pd_ratio_mode():
+            return None
+        best_row = self.get_best_result_row()
+        if best_row is None:
+            return None
+        return self._row_dict_from_filtered_best(device_label, best_row)
+
+    def collect_pd_ratio_comparison_row(self, device_label: str) -> Optional[dict]:
+        """Pick the best PD-ratio row (max ``balanced_qps`` after filtering) for cross-hardware."""
+        if not self._is_pd_ratio_mode():
+            return None
+        r = self.get_best_result_row()
+        if r is None:
+            return None
+        p_inst = int(r["p_instances"]) if "p_instances" in r and pd.notna(r["p_instances"]) else None
+        d_inst = int(r["d_instances"]) if "d_instances" in r and pd.notna(r["d_instances"]) else None
+        nd = self.data_config.num_devices
+
+        return {
+            "device": device_label,
+            "balanced_qps": float(r["balanced_qps"]),
+            "pd_ratio": float(r["pd_ratio"]),
+            "p_qps": float(r["p_qps"]),
+            "d_qps": float(r["d_qps"]),
+            "ttft_p": float(r["ttft_p"]),
+            "tpot_d": float(r["tpot_d"]),
+            "parallel_p": r["parallel_p"],
+            "parallel_d": r["parallel_d"],
+            "p_instances": p_inst,
+            "d_instances": d_inst,
+            "allocated_p_qps": float(r["allocated_p_qps"]) if "allocated_p_qps" in r else None,
+            "allocated_d_qps": float(r["allocated_d_qps"]) if "allocated_d_qps" in r else None,
+            "allocated_devices": int(r["allocated_devices"]) if "allocated_devices" in r else None,
+            "total_devices": int(nd) if nd is not None else None,
+        }
+
+    def _row_dict_from_filtered_best(self, device_label: str, r: pd.Series) -> dict:
+        def _fnum(key: str):
+            v = r.get(key)
+            if v is None or pd.isna(v):
+                return None
+            return float(v)
+
+        return {
+            "device": device_label,
+            "throughput_tps": float(r["token/s"]),
+            "ttft_ms": _fnum("ttft"),
+            "tpot_ms": _fnum("tpot"),
+            "concurrency": r["concurrency"],
+            "num_devices": r["num_devices"],
+            "parallel": r["parallel"],
+            "batch_size": r["batch_size"],
+            "qps_req_s": _compute_disagg_request_qps(r, getattr(self.data_config, "output_length", None)),
+        }
+
+    def _expand_composition_rows(self, best_df: pd.DataFrame) -> pd.DataFrame:
+        expanded_rows = []
+        match_columns = ["parallel", "batch_size", "concurrency", "num_devices"]
+
+        for _, best_row in best_df.iterrows():
+            matched_rows = self._summary_df.copy()
+            for column in match_columns:
+                matched_rows = matched_rows[matched_rows[column] == best_row[column]]
+
+            if matched_rows.empty:
+                continue
+
+            matched_rows = matched_rows.copy()
+            matched_rows["_is_aggregate"] = matched_rows["num_input_tokens"].astype(str) == "all"
+            matched_rows["_sort_num_input_tokens"] = pd.to_numeric(
+                matched_rows["num_input_tokens"],
+                errors="coerce",
+            )
+            matched_rows = matched_rows.sort_values(
+                by=["_is_aggregate", "_sort_num_input_tokens"],
+                ascending=[False, True],
+            ).drop(columns=["_is_aggregate", "_sort_num_input_tokens"])
+            expanded_rows.append(matched_rows)
+
+        if not expanded_rows:
+            return best_df
+
+        return pd.concat(expanded_rows, ignore_index=True)
+
+    def _get_agg_disagg_final_out_batched(self, args):
+        sorted_summary_df = self._prepare_agg_disagg_results()
+        if sorted_summary_df.empty:
+            logger.warning("No optimizer rows passed TTFT/TPOT filters; cannot pick best configuration.")
+            return [
+                "*" * 80,
+                "No configurations satisfy the current TTFT/TPOT filters.",
+                "*" * 80,
+            ]
+        best_result = sorted_summary_df.loc[0]
+        final_df = self._expand_composition_rows(sorted_summary_df)
+
+        final_out = []
+        final_out.append("*" * 80)
+
+        final_out.append("  " + "-" * 76)
+        final_out.append("  Input Configuration: ")
+        final_out.append(f"    Model: {args.model_id}")
+        final_out.append(f"    Quantize Linear action: {args.quantize_linear_action}")
+        final_out.append(f"    Quantize Attention action: {args.quantize_attention_action}")
+        final_out.append(f"    Devices: {args.num_devices} {args.device}")
+        final_out.append(f"    TTFT Limits: {self.data_config.ttft_limits} ms")
+        final_out.append(f"    TPOT Limits: {self.data_config.tpot_limits} ms")
+        final_out.append("  " + "-" * 76)
+
+        final_out.append("  Overall Best Configuration: ")
+        final_out.append(f"    Best Throughput: {best_result['token/s']:.2f} tokens/s")
+        if best_result["ttft"] is not None:
+            final_out.append(f"    TTFT: {best_result['ttft']:.2f} ms")
+        if best_result["tpot"] is not None:
+            final_out.append(f"    TPOT: {best_result['tpot']:.2f} ms")
+        final_out.append("  " + "-" * 76)
+
+        table_buf = _get_agg_disagg_table_buf_batched(final_df, args.disagg)
+        final_out.append(table_buf)
+        final_out.append("*" * 80)
+
+        return final_out
+
+    def _prepare_pd_ratio_results(self):
+        """Prepare and filter results for PD ratio mode.
+
+        Filters applied:
+        1. Apply a total-device allocation when at least one P/D pair is deployable
+        2. Keep only the best result for each unique (p_parallel, d_parallel) combination
+        3. Keep only one result for each unique balanced_qps value
+
+        Results are sorted by PD_RATIO_RANK_KEYS (see serving_cast.utils).
+        """
+        tpot_limit = self.data_config.tpot_limits or float("inf")
+        ttft_limit = self.data_config.ttft_limits or float("inf")
+
+        # Apply limits filter
+        mask = (pd.to_numeric(self._summary_df["ttft_p"], errors="coerce").fillna(float("inf")) <= ttft_limit) & (
+            pd.to_numeric(self._summary_df["tpot_d"], errors="coerce").fillna(float("inf")) <= tpot_limit
+        )
+
+        filtered_df = self._apply_pd_instance_distribution(self._summary_df[mask])
+        filtered_df = best_pd_row_per_group(filtered_df, ["parallel_p", "parallel_d"])
+        filtered_df["_balanced_qps_rounded"] = filtered_df["balanced_qps"].round(2)
+        result_df = best_pd_row_per_group(filtered_df, ["_balanced_qps_rounded"]).drop(
+            columns=["_balanced_qps_rounded"]
+        )
+        return rank_pd_ratio_rows(result_df).reset_index(drop=True)
+
+    def _apply_pd_instance_distribution(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply cluster instance allocation and recompute QPS when a budget is usable.
+
+        The shared CLI defaults ``num_devices`` to one even when the user does not
+        request a cluster allocation. In PD-ratio mode that value cannot fit the
+        required P+D instances, so the existing per-instance result is preserved
+        when no row has a feasible allocation.
+        """
+        total_devices = getattr(self.data_config, "num_devices", None)
+        if total_devices is None or df.empty:
+            return df
+
+        feasible_indices = []
+        updates = []
+        for index, row in df.iterrows():
+            p_inst, d_inst = self._calculate_instance_distribution(
+                float(row["pd_ratio"]),
+                int(total_devices),
+                int(row["num_devices_p"]),
+                int(row["num_devices_d"]),
+            )
+            if p_inst <= 0 or d_inst <= 0:
+                continue
+
+            feasible_indices.append(index)
+            allocated_p_qps = p_inst * float(row["p_qps"])
+            allocated_d_qps = d_inst * float(row["d_qps"])
+            updates.append(
+                {
+                    "p_instances": p_inst,
+                    "d_instances": d_inst,
+                    "allocated_p_qps": allocated_p_qps,
+                    "allocated_d_qps": allocated_d_qps,
+                    "balanced_qps": min(allocated_p_qps, allocated_d_qps),
+                    "allocated_devices": p_inst * int(row["num_devices_p"]) + d_inst * int(row["num_devices_d"]),
+                    "allocation_ratio_error": abs(p_inst / d_inst - float(row["pd_ratio"])),
+                }
+            )
+
+        if not feasible_indices:
+            return df
+
+        allocated_df = df.loc[feasible_indices].copy()
+        update_df = pd.DataFrame(updates, index=feasible_indices)
+        for column in update_df:
+            allocated_df[column] = update_df[column]
+        for column in ("p_instances", "d_instances", "allocated_devices"):
+            allocated_df[column] = allocated_df[column].astype(int)
+        return allocated_df
+
+    def _get_pd_ratio_final_out(self, args, sorted_summary_df):
+        """Generate the final output string for PD ratio mode.
+
+        Args:
+            args: Command line arguments.
+            sorted_summary_df: Pre-filtered and sorted DataFrame.
+        """
+        best_result = sorted_summary_df.loc[0]
+
+        final_out = []
+        final_out.append("*" * 120)
+
+        # Input Configuration section
+        final_out.append("  " + "-" * 116)
+        final_out.append("  Input Configuration:")
+        final_out.append(f"    Model: {args.model_id}")
+        # Only show Devices when user specifies --num-devices
+        if (
+            self.data_config.num_devices
+            >= self.data_config.prefill_devices_per_instance + self.data_config.decode_devices_per_instance
+        ):
+            final_out.append(f"    Devices: {self.data_config.num_devices} {args.device}")
+        final_out.append(f"    Prefill Devices Per Instance: {self.data_config.prefill_devices_per_instance}")
+        final_out.append(f"    Decode Devices Per Instance: {self.data_config.decode_devices_per_instance}")
+        final_out.append(f"    TTFT Limits: {self.data_config.ttft_limits} ms")
+        final_out.append(f"    TPOT Limits: {self.data_config.tpot_limits} ms")
+        final_out.append("  " + "-" * 116)
+
+        mem = self._memory_info
+        if mem:
+            final_out.append("  Memory Info:")
+            final_out.append(f"    Total device memory:  {_fmt_memory_info(mem, 'total_device_memory_gb')}")
+            final_out.append(f"    Reserved memory:      {_fmt_memory_info(mem, 'reserved_memory_gb')}")
+            final_out.append("  " + "-" * 116)
+
+        # Overall Best Configuration section
+        final_out.append("  Overall Best Configuration:")
+        final_out.append(f"      PD Ratio: {best_result['pd_ratio']:.2f} (P Instance:D Instance)")
+        final_out.append(
+            f"      Prefill QPS: {best_result['p_qps']:.2f} req/s  "
+            f"(TTFT: {best_result['ttft_p']:.2f} ms, Parallel: {best_result['parallel_p']}, "
+            f"Batch: {best_result['batch_size_p']}, Concurrency: {best_result['concurrency_p']})"
+        )
+        final_out.append(
+            f"      Decode QPS:  {best_result['d_qps']:.2f} req/s  "
+            f"(TPOT: {best_result['tpot_d']:.2f} ms, Parallel: {best_result['parallel_d']}, "
+            f"Batch: {best_result['batch_size_d']}, Concurrency: {best_result['concurrency_d']})"
+        )
+
+        # Show the cluster allocation when num_devices can fit at least one P+D pair.
+        total_devices = getattr(self.data_config, "num_devices", None)
+        if total_devices is not None:
+            if "p_instances" in best_result and pd.notna(best_result["p_instances"]):
+                p_inst = int(best_result["p_instances"])
+                d_inst = int(best_result["d_instances"])
+                allocated_p_qps = float(best_result["allocated_p_qps"])
+                allocated_d_qps = float(best_result["allocated_d_qps"])
+                balanced_qps = float(best_result["balanced_qps"])
+                allocated_devices = int(best_result["allocated_devices"])
+            else:
+                p_inst, d_inst = self._calculate_instance_distribution(
+                    best_result["pd_ratio"],
+                    total_devices,
+                    best_result["num_devices_p"],
+                    best_result["num_devices_d"],
+                )
+            if p_inst > 0 and d_inst > 0:
+                if "p_instances" not in best_result or pd.isna(best_result["p_instances"]):
+                    allocated_p_qps = p_inst * float(best_result["p_qps"])
+                    allocated_d_qps = d_inst * float(best_result["d_qps"])
+                    balanced_qps = min(allocated_p_qps, allocated_d_qps)
+                    allocated_devices = p_inst * int(best_result["num_devices_p"]) + d_inst * int(
+                        best_result["num_devices_d"]
+                    )
+                final_out.append(f"      P Instances: {p_inst} ({p_inst * best_result['num_devices_p']} devices)")
+                final_out.append(f"      D Instances: {d_inst} ({d_inst * best_result['num_devices_d']} devices)")
+                final_out.append(f"      Allocated Prefill QPS: {allocated_p_qps:.2f} req/s")
+                final_out.append(f"      Allocated Decode QPS:  {allocated_d_qps:.2f} req/s")
+                final_out.append(f"      Balanced QPS: {balanced_qps:.2f} req/s")
+                final_out.append(f"      Devices Used: {allocated_devices}/{int(self.data_config.num_devices)}")
+
+        final_out.append("  " + "-" * 116)
+
+        # Top N table (using filtered results)
+        table_buf = _get_pd_ratio_table_buf(sorted_summary_df)
+        final_out.append(table_buf)
+        final_out.append("*" * 120)
+
+        return final_out
+
+    def _calculate_instance_distribution(
+        self,
+        pd_ratio: float,
+        total_devices: int,
+        p_devices_per_inst: int,
+        d_devices_per_inst: int,
+    ) -> tuple[int, int]:
+        """Calculate the number of P and D instances.
+
+        Args:
+            pd_ratio: PD ratio (P:D ratio).
+            total_devices: Total number of devices available.
+            p_devices_per_inst: Devices per P instance.
+            d_devices_per_inst: Devices per D instance.
+
+        Returns:
+            Tuple of (p_instances, d_instances). Cluster balanced QPS is
+            maximized first, then device utilization, then ratio proximity.
+        """
+        # PD ratio = D_QPS / P_QPS
+        # For supply-demand balance: P_instances * P_QPS = D_instances * D_QPS
+        # So: P_instances / D_instances = D_QPS / P_QPS = pd_ratio
+        # Therefore: P_instances = D_instances * pd_ratio
+
+        best_p_inst = 0
+        best_d_inst = 0
+        best_score = None
+
+        max_d_inst = total_devices // d_devices_per_inst
+        for d_inst in range(1, max_d_inst + 1):
+            remaining_devices = total_devices - d_inst * d_devices_per_inst
+            p_inst = remaining_devices // p_devices_per_inst
+            if p_inst < 1:
+                break
+
+            # For a fixed d_inst, balanced QPS is monotonic in p_inst. Once
+            # it plateaus, the device-utilization tie-break also favors the
+            # largest feasible p_inst, so smaller P counts cannot win.
+            total_used = p_inst * p_devices_per_inst + d_inst * d_devices_per_inst
+            # Divide the real balanced QPS by P_QPS. Since
+            # pd_ratio=D_QPS/P_QPS, this preserves the ordering without
+            # adding redundant QPS arguments to this helper.
+            normalized_balanced_qps = min(float(p_inst), d_inst * pd_ratio)
+            ratio_error = abs(p_inst / d_inst - pd_ratio)
+            score = (normalized_balanced_qps, total_used, -ratio_error)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_p_inst = p_inst
+                best_d_inst = d_inst
+
+        return best_p_inst, best_d_inst
+
+
+def _fmt_memory(row, col: str) -> str:
+    """Format a memory column value for table display. Returns '-' if missing/NaN."""
+    val = row.get(col)
+    if val is None or pd.isna(val):
+        return "-"
+    return f"{val:.2f}"
+
+
+def _add_table_row(table: PrettyTable, row_data: list, columns: list[str]):
+    if len(row_data) != len(columns):
+        raise RuntimeError(
+            f"Optimizer summary table row length {len(row_data)} does not match column count {len(columns)}. "
+            "Ensure memory columns in add_row match the selected table columns."
+        )
+    table.add_row(row_data)
+
+
+def _get_agg_table_buf(df: pd.DataFrame):
+    show_len = len(df)
+    table_buf = []
+    table_buf.append(f"Top {show_len} PD Aggregated Configurations: ")
+    table = PrettyTable()
+    local_columns = SHOW_COLUMNS.copy()
+    if "qps" in df.columns:
+        local_columns.append("QPS (req/s)")
+    table.field_names = local_columns
+    for i in range(show_len):
+        row = df.loc[i]
+        row_data = [
+            i + 1,
+            f"\033[1m{row['token/s']:.2f}\033[0m",
+            f"{row['ttft']:.2f}",
+            f"{row['tpot']:.2f}",
+            row["concurrency"],
+            row["num_devices"],
+            row["parallel"],
+            row["batch_size"],
+            _fmt_memory(row, "weight_GB"),
+            _fmt_memory(row, "kv_cache_GB"),
+            _fmt_memory(row, "activation_GB"),
+            _fmt_memory(row, "avail_GB"),
+        ]
+        if "qps" in df.columns:
+            row_data.append("-" if pd.isna(row["qps"]) else f"{row['qps']:.4f}")
+        _add_table_row(table, row_data, local_columns)
+    table_buf.append(table.get_string())
+    return "\n".join(table_buf)
+
+
+def _get_disagg_table_buf(df: pd.DataFrame, output_length: Optional[int] = None):
+    local_column = SHOW_COLUMNS.copy()
+    ttft0 = df.iloc[0]["ttft"] if len(df) and "ttft" in df.columns else None
+    is_decode = ttft0 is None or pd.isna(ttft0)
+    show_len = len(df)
+    table_buf = []
+    table = PrettyTable()
+    if is_decode:
+        table_buf.append(f"Top {show_len} PD Disaggregated Decode Configurations: ")
+        local_column.insert(2, "QPS (req/s)")
+        local_column.remove(TTFT_COLUMN)
+    else:
+        table_buf.append(f"Top {show_len} PD Disaggregated Prefill Configurations: ")
+        local_column.insert(2, "QPS (req/s)")
+        local_column.remove(TPOT_COLUMN)
+
+    table.field_names = local_column
+    for i in range(show_len):
+        row = df.loc[i]
+        qps = _compute_disagg_request_qps(row, output_length)
+        qps_cell = f"{qps:.2f}" if qps is not None else "-"
+        row_data = [
+            i + 1,
+            f"\033[1m{row['token/s']:.2f}\033[0m",
+            qps_cell,
+            f"{row['tpot']:.2f}" if is_decode else f"{row['ttft']:.2f}",
+            row["concurrency"],
+            row["num_devices"],
+            row["parallel"],
+            row["batch_size"],
+            _fmt_memory(row, "weight_GB"),
+            _fmt_memory(row, "kv_cache_GB"),
+            _fmt_memory(row, "activation_GB"),
+            _fmt_memory(row, "avail_GB"),
+        ]
+        _add_table_row(table, row_data, local_column)
+    table_buf.append(table.get_string())
+    return "\n".join(table_buf)
+
+
+def _get_agg_disagg_table_buf_batched(df: pd.DataFrame, is_disagg: bool):
+    aggregate_mask = df["num_input_tokens"].astype(str) == "all"
+    show_len = int(aggregate_mask.sum())
+    table_buf = []
+    table = PrettyTable()
+
+    title = "Disaggregation (Prefill)" if is_disagg else "Aggregation"
+    table_buf.append(f"Top {show_len} {title} Configurations: ")
+    field_names = [
+        "Top",
+        "num_devices",
+        "num_input_tokens",
+        "request_ratio",
+        "samples",
+        "concurrency",
+        TTFT_COLUMN,
+        "\033[1mThroughput\033[0m (token/s)",
+        "parallel",
+        "batch_size",
+    ]
+    if not is_disagg:
+        field_names.insert(field_names.index(TTFT_COLUMN) + 1, TPOT_COLUMN)
+    table.field_names = field_names
+
+    def _format_value(value, fmt: str = None):
+        if pd.isna(value):
+            return "-"
+        if fmt is None:
+            return value
+        return fmt.format(value)
+
+    top_idx = 0
+    for _, row in df.iterrows():
+        is_aggregate = str(row.get("num_input_tokens", "-")) == "all"
+        if is_aggregate:
+            top_idx += 1
+        row_data = [
+            top_idx if is_aggregate else "-",
+            row["num_devices"],
+            row.get("num_input_tokens", "-"),
+            _format_value(row.get("request_ratio"), "{:.3f}"),
+            _format_value(row.get("samples")),
+            row["concurrency"],
+            _format_value(row["ttft"], "{:.2f}"),
+            _format_value(row["token/s"], "\033[1m{:.2f}\033[0m"),
+            row["parallel"],
+            row["batch_size"],
+        ]
+        if not is_disagg:
+            row_data.insert(field_names.index(TPOT_COLUMN), _format_value(row["tpot"], "{:.2f}"))
+        table.add_row(row_data)
+
+    table_buf.append(table.get_string())
+    return "\n".join(table_buf)
+
+
+def _get_pd_ratio_table_buf(df: pd.DataFrame):
+    """Generate the PD ratio table buffer.
+
+    Args:
+        df: DataFrame containing PD ratio results.
+
+    Returns:
+        String representation of the PD ratio table.
+    """
+    show_len = len(df)
+    table_buf = []
+    table_buf.append(f"  Top {show_len} PD Ratio Configurations:")
+
+    table = PrettyTable()
+
+    has_allocation = {
+        "p_instances",
+        "d_instances",
+        "allocated_p_qps",
+        "allocated_d_qps",
+        "allocated_devices",
+    }.issubset(df.columns)
+
+    columns = [
+        "Top",
+        "PD Ratio",
+        "Balanced QPS (req/s)",
+        "P QPS/Instance",
+        "D QPS/Instance",
+        "TTFT (ms)",
+        "TPOT (ms)",
+        "P Parallel",
+        "D Parallel",
+        "P Devices/Instance",
+        "D Devices/Instance",
+        "P Batch Size",
+        "D Batch Size",
+        "P Concurrency",
+        "D Concurrency",
+    ]
+    if has_allocation:
+        allocation_columns = [
+            "P Instances",
+            "D Instances",
+            "Allocated P QPS",
+            "Allocated D QPS",
+            "Devices Used",
+        ]
+        columns[5:5] = allocation_columns
+    table.field_names = columns
+
+    for i in range(show_len):
+        row = df.loc[i]
+        row_data = [
+            i + 1,
+            f"{row['pd_ratio']:.2f}",
+            f"{row['balanced_qps']:.2f}",
+            f"{row['p_qps']:.2f}",
+            f"{row['d_qps']:.2f}",
+            f"{row['ttft_p']:.2f}",
+            f"{row['tpot_d']:.2f}",
+            row["parallel_p"],
+            row["parallel_d"],
+            row["num_devices_p"],
+            row["num_devices_d"],
+            row["batch_size_p"],
+            row["batch_size_d"],
+            row["concurrency_p"],
+            row["concurrency_d"],
+        ]
+        if has_allocation:
+            allocation_data = [
+                int(row["p_instances"]),
+                int(row["d_instances"]),
+                f"{row['allocated_p_qps']:.2f}",
+                f"{row['allocated_d_qps']:.2f}",
+                int(row["allocated_devices"]),
+            ]
+            row_data[5:5] = allocation_data
+        _add_table_row(table, row_data, columns)
+
+    table_buf.append(table.get_string())
+    return "\n".join(table_buf)
+
+
+def render_cross_device_comparison(rows: list[dict]) -> str:
+    """Pretty-print a ranked table of best configs across hardware profiles."""
+    if not rows:
+        return ""
+    sorted_rows = _sorted_rows(rows, "throughput_tps")
+    lines = [
+        "",
+        "*" * 100,
+        "  Cross-hardware - PD Aggregated (best throughput config per device under TTFT/TPOT limits)",
+        "  " + "-" * 96,
+    ]
+    table = PrettyTable()
+    table.field_names = [
+        "Top",
+        "Device",
+        "Throughput (token/s)",
+        "TTFT (ms)",
+        "TPOT (ms)",
+        "Concurrency",
+        "Parallel",
+        "Batch",
+        "num_devices",
+    ]
+    for i, row in enumerate(sorted_rows):
+        table.add_row(
+            [
+                i + 1,
+                row.get("device", ""),
+                f"{row['throughput_tps']:.2f}",
+                _fmt_optional(row.get("ttft_ms")),
+                _fmt_optional(row.get("tpot_ms")),
+                row.get("concurrency", ""),
+                row.get("parallel", ""),
+                row.get("batch_size", ""),
+                row.get("num_devices", ""),
+            ]
+        )
+    lines.append(table.get_string())
+    lines.append("*" * 100)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_cross_hardware_pd_ratio(rows: list[dict]) -> str:
+    """Cross-device PD ratio: one row per hardware (best balanced QPS after PD filtering)."""
+    if not rows:
+        return ""
+    sorted_rows = sort_pd_ratio_dict_rows(rows)
+    banner_w = 120
+    lines = [
+        "",
+        "*" * banner_w,
+        "  Cross-hardware - PD Ratio (best balanced QPS per device under TTFT/TPOT limits)",
+        "  " + "-" * (banner_w - 4),
+    ]
+    table = PrettyTable()
+    table.field_names = [
+        "Top",
+        "Device",
+        "Balanced QPS (req/s)",
+        "PD Ratio (P:D inst)",
+        "P QPS/Instance",
+        "D QPS/Instance",
+        "Allocated P QPS",
+        "Allocated D QPS",
+        "TTFT (ms)",
+        "TPOT (ms)",
+        "P inst",
+        "D inst",
+    ]
+    for i, row in enumerate(sorted_rows):
+        p_inst = row.get("p_instances")
+        d_inst = row.get("d_instances")
+        table.add_row(
+            [
+                i + 1,
+                row.get("device", ""),
+                f"{row['balanced_qps']:.2f}",
+                f"{row['pd_ratio']:.2f}",
+                f"{row['p_qps']:.2f}",
+                f"{row['d_qps']:.2f}",
+                f"{row['allocated_p_qps']:.2f}" if row.get("allocated_p_qps") is not None else "-",
+                f"{row['allocated_d_qps']:.2f}" if row.get("allocated_d_qps") is not None else "-",
+                f"{row['ttft_p']:.2f}",
+                f"{row['tpot_d']:.2f}",
+                str(p_inst) if p_inst is not None else "-",
+                str(d_inst) if d_inst is not None else "-",
+            ]
+        )
+    lines.append(table.get_string())
+    if any(r.get("p_instances") is not None for r in sorted_rows):
+        td = sorted_rows[0].get("total_devices")
+        if td is not None:
+            lines.append(
+                "  P/D instance counts maximize allocated balanced QPS under "
+                f"--num-devices={td} (same rule as per-device Overall Best)."
+            )
+    lines.append("*" * banner_w)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_cross_hardware_disagg_prefill(rows: list[dict]) -> str:
+    """Cross-device table for disaggregation Prefill phase (TTFT-constrained)."""
+    if not rows:
+        return ""
+    sorted_rows = _sorted_rows(rows, "throughput_tps")
+    lines = [
+        "",
+        "*" * 108,
+        "  Cross-hardware - PD Disaggregated Prefill (best token/s per device under TTFT limits)",
+        "  " + "-" * 104,
+    ]
+    table = PrettyTable()
+    table.field_names = [
+        "Top",
+        "Device",
+        "Prefill throughput (token/s)",
+        "QPS (req/s)",
+        "TTFT (ms)",
+        "TPOT (ms)",
+        "Concurrency",
+        "Parallel",
+        "Batch",
+        "num_devices",
+    ]
+    for i, row in enumerate(sorted_rows):
+        table.add_row(
+            [
+                i + 1,
+                row.get("device", ""),
+                f"{row['throughput_tps']:.2f}",
+                _fmt_optional(row.get("qps_req_s")),
+                _fmt_optional(row.get("ttft_ms")),
+                "-",
+                row.get("concurrency", ""),
+                row.get("parallel", ""),
+                row.get("batch_size", ""),
+                row.get("num_devices", ""),
+            ]
+        )
+    lines.append(table.get_string())
+    lines.append("*" * 108)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_cross_hardware_disagg_decode(rows: list[dict]) -> str:
+    """Cross-device table for disaggregation Decode phase (TPOT-constrained)."""
+    if not rows:
+        return ""
+    sorted_rows = _sorted_rows(rows, "throughput_tps")
+    lines = [
+        "",
+        "*" * 108,
+        "  Cross-hardware - PD Disaggregated Decode (best token/s per device under TPOT limits)",
+        "  " + "-" * 104,
+    ]
+    table = PrettyTable()
+    table.field_names = [
+        "Top",
+        "Device",
+        "Decode throughput (token/s)",
+        "QPS (req/s)",
+        "TTFT (ms)",
+        "TPOT (ms)",
+        "Concurrency",
+        "Parallel",
+        "Batch",
+        "num_devices",
+    ]
+    for i, row in enumerate(sorted_rows):
+        table.add_row(
+            [
+                i + 1,
+                row.get("device", ""),
+                f"{row['throughput_tps']:.2f}",
+                _fmt_optional(row.get("qps_req_s")),
+                "-",
+                _fmt_optional(row.get("tpot_ms")),
+                row.get("concurrency", ""),
+                row.get("parallel", ""),
+                row.get("batch_size", ""),
+                row.get("num_devices", ""),
+            ]
+        )
+    lines.append(table.get_string())
+    lines.append("*" * 108)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_hardware_profile_comparison(device_names: list[str]) -> str:
+    """Pretty-print core modeling parameters for multiple ``--device`` profiles.
+
+    Compact ASCII-oriented labels: effective cube/vector compute, memory bandwidth,
+    communication bandwidth, capacity, and logical comm-grid shape.
+    """
+    if not device_names:
+        return ""
+    try:
+        import torch
+
+        from tensor_cast import device_profiles  # noqa: F401 - register profiles
+        from tensor_cast.device import DeviceProfile
+    except ImportError as exc:
+        logger.warning("Hardware profile comparison skipped: %s", exc)
+        return ""
+
+    ordered = list(dict.fromkeys(device_names))
+    banner_w = 108
+    lines = [
+        "",
+        "*" * banner_w,
+        "  Cross-hardware - device profile summary (modeling abstraction vs performance merge tables)",
+        "  Device profile parameter comparison (effective compute / memory BW / comm BW)",
+        "  " + "-" * (banner_w - 4),
+    ]
+    table = PrettyTable()
+    table.field_names = [
+        "Device",
+        "Cube Compute (TFLOPS)",
+        "Vector Compute (TFLOPS)",
+        "HBM BW (TB/s)",
+        "Memory (GB)",
+        "Comm Grid",
+        "Comm BW (GB/s)",
+    ]
+
+    def _effective_tflops(ops: dict, profile: DeviceProfile) -> Optional[float]:
+        peak = ops.get(torch.bfloat16)
+        if peak is None:
+            peak = ops.get(torch.half)
+        if peak is None and ops:
+            peak = max(ops.values())
+        if peak is None:
+            return None
+        return (peak / 1e12) * profile.compute_efficiency
+
+    def _fmt_compact_num(value: float) -> str:
+        return f"{value:g}"
+
+    def _comm_bw_expr(profile: DeviceProfile) -> str:
+        parts = []
+        for idx in sorted(profile.comm_grid.topologies):
+            topology = profile.comm_grid.topologies[idx]
+            eff_bw_gbs = topology.bandwidth_bytes_ps * topology.comm_efficiency / 1e9
+            parts.append(_fmt_compact_num(eff_bw_gbs))
+        return " | ".join(parts) if parts else "-"
+
+    def _shape_str(profile: DeviceProfile) -> str:
+        g = profile.comm_grid.grid
+        return " x ".join(str(int(x)) for x in g.shape)
+
+    for name in ordered:
+        prof = DeviceProfile.all_device_profiles.get(name)
+        if prof is None:
+            table.add_row([name, "-", "-", "-", "-", "-", "-"])
+            continue
+        cube = _effective_tflops(prof.mma_ops, prof)
+        vector = _effective_tflops(prof.gp_ops, prof)
+        nom_bw_TBs = prof.memory_bandwidth_bytes_ps / (1024**4)
+        eff_bw_TBs = nom_bw_TBs * prof.memory_efficiency
+        mem_gb = prof.memory_size_bytes / (1024**3)
+        table.add_row(
+            [
+                prof.name,
+                f"{cube:.2f}" if cube is not None else "-",
+                f"{vector:.2f}" if vector is not None else "-",
+                f"{eff_bw_TBs:.3f}",
+                f"{mem_gb:.1f}",
+                _shape_str(prof),
+                _comm_bw_expr(prof),
+            ]
+        )
+
+    lines.append(table.get_string())
+    lines.extend(
+        [
+            "  Notes:",
+            "  - Cube/Vector Compute: nominal BF16 peak x compute_efficiency (FP16 peak if BF16 unset).",
+            "  - HBM BW: nominal HBM bandwidth x memory_efficiency.",
+            "  - Comm BW: effective GB/s per topology (bandwidth_bytes_ps x comm_efficiency / 1e9), in topology order.",
+            "    Example: 50 x 0.7 = 35 GB/s.",
+        ]
+    )
+    lines.append("*" * banner_w)
+    lines.append("")
+    return "\n".join(lines)

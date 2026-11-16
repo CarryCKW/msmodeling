@@ -1,0 +1,52 @@
+# GLM-4V dense text decoder fragment.
+fragment_id: glm4v_dense_decoder_v1
+fragment_kind: model_decoder
+stages:
+  - id: attention_qkv
+    modules:
+      - name: q_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, Lh * Dh]", dtype: OUT}
+      - name: k_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, Lkv * Dh]", dtype: OUT}
+      - name: v_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, Lkv * Dh]", dtype: OUT}
+    runtime:
+      # Match the complete input RMSNorm sequence, not one of its dtype casts.
+      boundary_operators: [rms_norm]
+      ignored_operator_groups: [quantization, dtype_cast, rotary_embedding, layout_permute, shape_views, tensor_storage, broadcast_shapes, norm_math_with_add, slice_select, tensor_split]
+      ignored_operators:
+        - index
+        - index_select
+        - neg
+        - cat
+        - stack
+        - reshape_and_cache
+  - id: attention
+    modules:
+      - name: attention
+        tensors:
+          OUTPUT[0]: {shape: "[T, Lh * Dh]", dtype: OUT}
+      - name: o_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, H]", dtype: OUT}
+    runtime:
+      boundary_operators: [attention]
+      ignored_operator_groups: [collective_communication, quantization, dtype_cast, layout_permute, shape_views, tensor_storage, norm_math_with_add, slice_select]
+  - id: dense_ffn
+    modules:
+      - name: gate_up_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, 2 * Ftp]", dtype: OUT}
+      - name: silu
+        tensors:
+          OUTPUT[0]: {shape: "[B, Q, Ftp]", dtype: ACT}
+      - name: down_projection
+        tensors:
+          OUTPUT[0]: {shape: "[T, H]", dtype: OUT}
+    runtime:
+      # Match the complete pre-FFN RMSNorm sequence, not one of its dtype casts.
+      boundary_operators: [rms_norm]
+      ignored_operator_groups: [collective_communication, rms_norm_kernels, quantization, dtype_cast, layout_permute, shape_views, tensor_storage, norm_math_with_add, slice_select, tensor_split]

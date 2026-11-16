@@ -1,0 +1,49 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import torch
+from tensor_cast.layers.quant_linear import QuantLinearBase
+from tensor_cast.model_config import ParallelConfig
+from tensor_cast.quantize_utils import LinearQuantType
+from tests.regression.tensor_cast.test_common import get_linear_quant_config
+
+
+def test_tensor_cast_parallel_layer_smoke():
+    cfg = ParallelConfig(world_size=4, tensor_parallel_size=2, data_parallel_size=2)
+    assert cfg.has_attn_tp()
+    assert cfg.data_parallel_size == 2
+    linear = torch.nn.Linear(8, 4, bias=False, dtype=torch.float32)
+    quant_layer = QuantLinearBase(
+        linear,
+        get_linear_quant_config(LinearQuantType.W8A16, linear.weight.data),
+    )
+    x = torch.randn(2, 8, dtype=torch.float32)
+    y = quant_layer(x)
+    assert y.shape == (2, 4)
+
+
+def test_quant_linear_base_weight_property_preserves_public_linear_contract():
+    linear = torch.nn.Linear(8, 4, bias=False, dtype=torch.float32)
+    quant_layer = QuantLinearBase(
+        linear,
+        get_linear_quant_config(LinearQuantType.W8A16, linear.weight.data),
+    )
+
+    weight = quant_layer.weight
+
+    assert weight.shape == linear.weight.shape
+    assert weight.dtype == linear.weight.dtype
+    assert weight.device == quant_layer.qweight.device

@@ -1,0 +1,347 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2025-2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import json
+import os
+from collections import deque
+from dataclasses import fields, is_dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from serving_cast import stime
+from serving_cast.request import RequestState
+
+logger = stime.get_logger(__name__)
+
+# Granularity (s) of the client-side polling loop that waits for a free
+# concurrency slot.
+_CONCURRENCY_POLL_INTERVAL = 0.1
+# Tolerance for floating-point accumulation when slicing an interval into
+# poll steps (e.g. 0.3 - 3 * 0.1 leaves ~5.5e-17 due to IEEE 754 rounding).
+_FLOAT_TOLERANCE = 1e-9
+
+
+def _admit_pending_requests(serving, pending):
+    """Admit FIFO-ordered requests as long as concurrency slots are free.
+
+    A request only leaves the client once it actually obtains a concurrency
+    slot; client-side queuing must not start the per-request timers.
+    """
+    while pending and not serving.exceed_concurrency_limit():
+        request = pending.popleft()
+        request.state = RequestState.LEAVES_CLIENT
+        serving.serve(request)
+
+
+def main_processing(serving, load_gen):
+    """Drive the load generator against the serving system.
+
+    Requests are attempted at the load generator's configured rate. A rate
+    tick is only an *attempt*: while the server concurrency gate is full the
+    request stays at the client in a FIFO queue and is admitted by
+    ``_admit_pending_requests`` within ``_CONCURRENCY_POLL_INTERVAL`` seconds
+    of a slot freeing up. LEAVES_CLIENT is recorded only when a request
+    actually obtains a slot, so per-request client timers
+    (CLIENT_TTFT / ADMISSION_WAIT / E2E_TIME) start at the real send time.
+
+    Returns only after all requests have been generated and their responses
+    completed (``load_gen.is_finished()``), then stops the simulation.
+    """
+    # Requests that were attempted while the concurrency gate was full and
+    # are still waiting at the client (FIFO order).
+    pending = deque()
+    while load_gen.has_request() or pending:
+        _admit_pending_requests(serving, pending)
+        if not load_gen.has_request():
+            # All requests attempted; wait for slots for the queued ones.
+            stime.elapse(_CONCURRENCY_POLL_INTERVAL)
+            continue
+        request, interval = load_gen.next_request()
+        # A new attempt never jumps ahead of earlier queued requests.
+        if pending or serving.exceed_concurrency_limit():
+            pending.append(request)
+        else:
+            request.state = RequestState.LEAVES_CLIENT
+            serving.serve(request)
+        if interval > 0:
+            if pending:
+                # Keep attempts on schedule while polling for free slots so
+                # queued requests are admitted within the poll granularity.
+                remaining = interval
+                while remaining > _FLOAT_TOLERANCE and pending:
+                    step = min(_CONCURRENCY_POLL_INTERVAL, remaining)
+                    stime.elapse(step)
+                    remaining -= step
+                    _admit_pending_requests(serving, pending)
+                if remaining > _FLOAT_TOLERANCE:
+                    # pending drained early: sleep the rest of the interval
+                    # in one hold instead of polling with an empty queue.
+                    stime.elapse(remaining)
+            else:
+                stime.elapse(interval)
+    while not load_gen.is_finished():
+        stime.elapse(10)
+
+    logger.debug("time %.1f: all of the requests are finished, stop simulation", stime.now())
+    stime.stop_simulation()
+
+
+def summarize(requests_list, output_json_path: str | None = None):
+    """
+    Compute and print performance metrics for a completed request trace.
+
+    Parameters
+    ----------
+    requests_list : list[Request]
+        A list of request objects that have finished execution. Each object
+        is expected to contain at least the following attributes:
+        - leaves_client_time   : float  # client departure timestamp
+        - arrives_server_time  : float  # server arrival timestamp
+        - prefill_done_time    : float  # prefill completion timestamp
+        - decode_done_time     : float  # full response completion timestamp
+        - num_input_tokens     : int
+        - num_output_tokens    : int
+    output_json_path : str, optional
+        If given, the summary (per-metric table and overall summary) is also
+        serialized as JSON to this file path.
+
+    Returns
+    -------
+    None
+        Results are printed to stdout in two blocks:
+        1. A per-metric summary table (count, average, min, max, median, p75, p90, p99).
+        2. An overall summary containing:
+           - benchmark duration (s)
+           - total request / input-token / output-token counts
+           - derived throughputs (req/s, tok/s)
+
+    Notes
+    -----
+    Client-side concurrency semantics (AIPerf-compatible): each request_rate
+    tick is an *attempt* to send. While the server concurrency gate is full
+    the request stays at the client; `leaves_client_time` is recorded only
+    when the request actually obtains a concurrency slot and is sent.
+    Therefore all client-side timers start at the real send time and exclude
+    client-side queuing.
+
+    - E2E_TIME      : end-to-end latency (decode_done - leaves_client)
+    - CLIENT_TTFT   : client departure to prefill completion
+    - SERVER_TTFT   : server arrival to prefill completion
+    - ADMISSION_WAIT: client departure to server arrival (transport delay
+                      only; ~0 in simulation, since client-side queuing
+                      happens before leaves_client_time)
+    - TPOT          : time-per-output-token from Request.time_per_output_token()
+    - All throughput figures are computed against the *wall-clock* span from
+      the first request leaving the client to the last response finishing decode.
+    """
+
+    # 1. Compute per-sample metrics
+    def calc_metrics(req) -> pd.Series:
+        e2e = req.decode_done_time - req.leaves_client_time
+        client_ttft = req.client_time_to_first_token()
+        server_ttft = req.server_time_to_first_token()
+        admission_wait = req.admission_wait()
+        tpot = req.time_per_output_token()
+        out_tps = req.num_output_tokens / max(0.001, (req.decode_done_time - req.prefill_done_time))
+        return pd.Series(
+            [
+                e2e,
+                client_ttft,
+                server_ttft,
+                admission_wait,
+                tpot,
+                req.num_input_tokens,
+                req.num_output_tokens,
+                out_tps,
+            ],
+            index=[
+                "E2E_TIME(s)",
+                "CLIENT_TTFT(s)",
+                "SERVER_TTFT(s)",
+                "ADMISSION_WAIT(s)",
+                "TPOT(s)",
+                "INPUT_TOKENS",
+                "OUTPUT_TOKENS",
+                "OUTPUT_TOKEN_THROUGHPUT(tok/s)",
+            ],
+        )
+
+    # 2. Build DataFrame
+    df = pd.DataFrame([calc_metrics(r) for r in requests_list])
+
+    # 3. Aggregation functions
+    aggs = {
+        "AVERAGE": np.mean,
+        "MIN": np.min,
+        "MAX": np.max,
+        "MEDIAN": np.median,
+        "P75": lambda x: np.percentile(x, 75),
+        "P90": lambda x: np.percentile(x, 90),
+        "P99": lambda x: np.percentile(x, 99),
+    }
+
+    # 4. Summary table
+    summary = pd.DataFrame(
+        {col: [fn(df[col]) for fn in aggs.values()] for col in df.columns},
+        index=pd.Index(aggs.keys()),
+    )
+
+    output_str = "\n" + summary.round(3).to_string()
+
+    # ------------------------------------------------------------------
+    # 5. Overall performance summary
+    # Use timestamp boundaries (units consistent, usually seconds)
+    benchmark_duration = max(r.decode_done_time for r in requests_list) - min(
+        r.leaves_client_time for r in requests_list
+    )
+
+    total_requests = len(requests_list)
+    total_input_tokens = sum(r.num_input_tokens for r in requests_list)
+    total_output_tokens = sum(r.num_output_tokens for r in requests_list)
+
+    report = {
+        "benchmark_duration(s)": benchmark_duration,
+        "total_requests": total_requests,
+        "request_throughput(req/s)": total_requests / benchmark_duration,
+        "total_input_tokens": total_input_tokens,
+        "input_token_throughput(tok/s)": total_input_tokens / benchmark_duration,
+        "total_output_tokens": total_output_tokens,
+        "output_token_throughput(tok/s)": total_output_tokens / benchmark_duration,
+    }
+
+    output_str += "\n======== Overall Summary ========"
+    for k, v in report.items():
+        output_str += f"\n{k:<30} {v:.3f}"
+
+    print(output_str)
+
+    if output_json_path:
+        per_metric_summary = {
+            column: {row: float(summary.at[row, column]) for row in summary.index} for column in summary.columns
+        }
+        overall_summary = {k: float(v) for k, v in report.items()}
+        payload = {
+            "per_metric_summary": per_metric_summary,
+            "overall_summary": overall_summary,
+        }
+        out_dir = os.path.dirname(output_json_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        with open(output_json_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        logger.info("Summary JSON written to %s", output_json_path)
+
+
+def _convert_value(value: Any, *, skip_none: bool) -> Any:
+    """Recursively handle nested structures"""
+    if is_dataclass(value):
+        return dataclass2dict(value, skip_none=skip_none)
+
+    if isinstance(value, list):
+        return [_convert_value(v, skip_none=skip_none) for v in value]
+
+    if isinstance(value, dict):
+        return {k: _convert_value(v, skip_none=skip_none) for k, v in value.items()}
+
+    return value
+
+
+def dataclass2dict(obj: Any, *, skip_none: bool = False) -> dict[str, Any]:
+    """
+    Recursively convert a dataclass instance to a plain dict
+    (dataclasses inside lists/dicts are also converted).
+
+    Args:
+        obj: dataclass instance to convert
+        skip_none: whether to skip fields whose value is None
+
+    Returns:
+        Plain Python dict ready for json.dump
+    """
+    if not is_dataclass(obj):
+        raise TypeError(f"dataclass2dict() expects a dataclass instance, got {type(obj)}")
+
+    result: dict[str, Any] = {}
+    for field in fields(obj):
+        value = getattr(obj, field.name)
+        if skip_none and value is None:
+            continue
+        result[field.name] = _convert_value(value, skip_none=skip_none)
+    return result
+
+
+def get_basic_timestamp() -> str:
+    """
+    Generate a basic timestamp string with date and time (no special characters).
+
+    Format: YYYY-MM-DD_HH-MM-SS (e.g., 2024-05-20_14-30-45)
+    """
+    # Get current local time
+    current_time = datetime.now(tz=timezone.utc)
+    # Format is Year-Month-Day_Hour-Minute-Second
+    timestamp = current_time.strftime("%Y-%m-%d_%H-%M-%S")
+    return timestamp
+
+
+def gen_profiling_config_set_env_variable(prof_dir):
+    config = {"enable": 1, "prof_dir": prof_dir, "profiler_level": "INFO"}
+    json_path = os.path.join(prof_dir, "profiling_config.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+    os.environ["SERVICE_PROF_CONFIG_PATH"] = json_path
+
+
+# (column, ascending): higher QPS/throughput first; lower latency first on ties.
+PD_RATIO_RANK_KEYS: tuple[tuple[str, bool], ...] = (
+    ("balanced_qps", False),
+    ("allocated_devices", False),
+    ("allocation_ratio_error", True),
+    ("d_qps", False),
+    ("p_qps", False),
+    ("ttft_p", True),
+    ("tpot_d", True),
+    ("batch_size_d", False),
+    ("batch_size_p", False),
+    ("concurrency_d", False),
+    ("concurrency_p", False),
+    ("parallel_p", True),
+    ("parallel_d", True),
+)
+
+
+def rank_pd_ratio_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort PD ratio DataFrame by PD_RATIO_RANK_KEYS (stable)."""
+    keys = [(col, asc) for col, asc in PD_RATIO_RANK_KEYS if col in df.columns]
+    if not keys:
+        return df
+    cols, ascending = zip(*keys)
+    return df.sort_values(by=list(cols), ascending=list(ascending), kind="stable")
+
+
+def best_pd_row_per_group(df: pd.DataFrame, group_keys: list[str]) -> pd.DataFrame:
+    """Keep the top-ranked row per group (stable tie-break, see PD_RATIO_RANK_KEYS)."""
+    return rank_pd_ratio_rows(df).groupby(group_keys, as_index=False, sort=False).head(1)
+
+
+def sort_pd_ratio_dict_rows(rows: list[dict]) -> list[dict]:
+    """Sort PD ratio dict rows using the same keys as rank_pd_ratio_rows."""
+    if not rows:
+        return rows
+    return rank_pd_ratio_rows(pd.DataFrame(rows)).to_dict("records")

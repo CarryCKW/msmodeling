@@ -1,0 +1,584 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2025-2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import argparse
+import unittest
+from pathlib import Path
+
+import pytest
+
+from serving_cast.service.utils import (
+    BatchRangeAction,
+    LengthBin,
+    LengthDistribution,
+    OptimizerData,
+    PrefillChunk,
+    check_positive_float,
+    check_positive_integer,
+    check_positive_integer_and_string,
+    check_string_valid,
+    format_parallel_label,
+    load_length_distribution,
+)
+from tensor_cast.model_config import ParallelConfig
+
+
+def _simple_length_distribution():
+    return LengthDistribution(
+        bins=[
+            LengthBin(min_tokens=0, max_tokens=500, weight=0.6),
+            LengthBin(min_tokens=500, max_tokens=1500, weight=0.4),
+        ]
+    )
+
+
+class TestServiceUtils(unittest.TestCase):
+    def test_check_string_valid_within_limit_and_valid_chars(self):
+        """Test check_string_valid with valid string"""
+        valid_string = "valid_string123/test-path.file"
+        result = check_string_valid(valid_string, max_len=100)
+        self.assertEqual(result, valid_string)
+
+    def test_check_positive_integer_valid(self):
+        """Test check_positive_integer with valid integers"""
+        self.assertEqual(check_positive_integer("1"), 1)
+        self.assertEqual(check_positive_integer("100"), 100)
+        self.assertEqual(check_positive_integer("1048576"), 1048576)
+        self.assertEqual(check_positive_integer(5), 5)
+
+    def test_check_positive_integer_invalid_string(self):
+        """Test check_positive_integer with invalid string"""
+        with self.assertRaises(argparse.ArgumentTypeError):
+            check_positive_integer("abc")
+
+    def test_check_positive_integer_non_positive(self):
+        """Test check_positive_integer with non-positive values"""
+        with self.assertRaises(argparse.ArgumentTypeError):
+            check_positive_integer("0")
+
+        with self.assertRaises(argparse.ArgumentTypeError):
+            check_positive_integer("-1")
+
+    def test_check_positive_integer_too_large(self):
+        """Test check_positive_integer with very large value"""
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "100000001.*too large"):
+            check_positive_integer("100000001")  # Greater than 1e8
+
+    def test_check_positive_integer_and_string_accepts_positive_integer(self):
+        self.assertEqual(check_positive_integer_and_string("128"), 128)
+
+    def test_check_positive_integer_and_string_accepts_file_path(self):
+        path = "serving_cast/example/length_distribution.yaml"
+
+        self.assertEqual(check_positive_integer_and_string(path), path)
+
+    def test_check_positive_integer_and_string_rejects_invalid_value(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            check_positive_integer_and_string("not-a-length-or-file")
+
+    def test_check_positive_float_valid(self):
+        """Test check_positive_float with valid floats"""
+        self.assertEqual(check_positive_float("1.5"), 1.5)
+        self.assertEqual(check_positive_float("100"), 100.0)
+        self.assertEqual(check_positive_float("inf"), float("inf"))
+        self.assertEqual(check_positive_float("INF"), float("inf"))
+
+    def test_check_positive_float_invalid(self):
+        """Test check_positive_float with invalid values"""
+        with self.assertRaises(argparse.ArgumentTypeError):
+            check_positive_float("abc")
+
+        with self.assertRaises(argparse.ArgumentTypeError):
+            check_positive_float("0")
+
+        with self.assertRaises(argparse.ArgumentTypeError):
+            check_positive_float("-1.5")
+
+    def test_optimizer_data_creation(self):
+        """Test OptimizerData creation with default values"""
+        config = OptimizerData()
+        self.assertIsNone(config.input_length)
+        self.assertIsNone(config.output_length)
+        self.assertEqual(config.prefix_cache_hit_rate, 0.0)
+
+    def test_optimizer_data_effective_input_length_with_prefix_cache(self):
+        config = OptimizerData(input_length=200, prefix_cache_hit_rate=0.5)
+        self.assertEqual(config.get_effective_input_length(), 100)
+
+    def test_optimizer_data_effective_input_length_ignores_prefix_cache_in_decode(self):
+        config = OptimizerData(input_length=200, prefix_cache_hit_rate=0.5)
+        self.assertEqual(config.get_effective_input_length(is_decode=True), 200)
+
+    def test_optimizer_data_decode_context_length_uses_raw_input_length(self):
+        config = OptimizerData(input_length=200, prefix_cache_hit_rate=0.5)
+
+        self.assertEqual(config.get_decode_context_length(), 200)
+
+    def test_optimizer_data_prefill_cached_prefix_length(self):
+        config = OptimizerData(input_length=200, prefix_cache_hit_rate=0.5)
+
+        self.assertEqual(config.get_prefill_cached_prefix_length(), 100)
+
+    def test_optimizer_data_prefill_cached_prefix_and_effective_length_preserve_input_length(self):
+        config = OptimizerData(input_length=1000, prefix_cache_hit_rate=0.999)
+
+        effective_length = config.get_effective_input_length()
+        cached_prefix_length = config.get_prefill_cached_prefix_length()
+
+        self.assertEqual(effective_length, 1)
+        self.assertEqual(cached_prefix_length, 999)
+        self.assertEqual(effective_length + cached_prefix_length, config.input_length)
+
+    def test_optimizer_data_prefill_cached_prefix_rejects_full_hit_rate(self):
+        config = OptimizerData(input_length=1000, prefix_cache_hit_rate=1.0)
+
+        with self.assertRaisesRegex(ValueError, "Effective input length must be at least 1"):
+            config.get_prefill_cached_prefix_length()
+
+    def test_optimizer_data_prefill_chunk_plan_single_chunk(self):
+        config = OptimizerData(input_length=4096, max_batched_tokens=8192)
+        self.assertEqual(
+            config.get_prefill_chunk_plan(),
+            [PrefillChunk(index=0, query_len=4096, seq_len=4096, is_last_chunk=True)],
+        )
+
+    def test_optimizer_data_prefill_chunk_plan_multiple_chunks(self):
+        config = OptimizerData(input_length=10000, max_batched_tokens=4096)
+        self.assertEqual(
+            config.get_prefill_chunk_plan(),
+            [
+                PrefillChunk(index=0, query_len=4096, seq_len=4096),
+                PrefillChunk(index=1, query_len=4096, seq_len=8192),
+                PrefillChunk(index=2, query_len=1808, seq_len=10000, is_last_chunk=True),
+            ],
+        )
+
+    def test_optimizer_data_prefill_chunk_plan_applies_prefix_cache(self):
+        config = OptimizerData(input_length=10, max_batched_tokens=3, prefix_cache_hit_rate=0.5)
+
+        self.assertEqual(
+            config.get_prefill_chunk_plan(),
+            [
+                PrefillChunk(index=0, query_len=3, seq_len=8),
+                PrefillChunk(index=1, query_len=2, seq_len=10, is_last_chunk=True),
+            ],
+        )
+
+    def test_optimizer_data_variable_prefill_chunk_plan_uses_concurrency_samples(self):
+        config = OptimizerData(
+            length_distribution=LengthDistribution(
+                bins=[
+                    LengthBin(min_tokens=0, max_tokens=100, weight=1.0),
+                    LengthBin(min_tokens=100, max_tokens=200, weight=1.0),
+                ]
+            ),
+            max_batched_tokens=200,
+        )
+
+        self.assertEqual(
+            config.get_prefill_chunk_plan(concurrency=4),
+            [
+                PrefillChunk(index=0, query_len=50, seq_len=50, is_last_chunk=True),
+                PrefillChunk(index=0, query_len=50, seq_len=50, is_last_chunk=True),
+                PrefillChunk(index=0, query_len=100, seq_len=100),
+                PrefillChunk(index=1, query_len=50, seq_len=150, is_last_chunk=True),
+                PrefillChunk(index=1, query_len=150, seq_len=150, is_last_chunk=True),
+            ],
+        )
+        chunk_plan = config.get_prefill_chunk_plan(concurrency=4)
+        self.assertEqual(config.get_prefill_num_chunks(chunk_plan), 2)
+
+    def test_optimizer_data_variable_prefill_chunk_plan_keeps_cached_prefix_in_seq_len(self):
+        config = OptimizerData(
+            length_distribution=LengthDistribution(bins=[LengthBin(min_tokens=100, max_tokens=200, weight=1.0)]),
+            max_batched_tokens=50,
+            prefix_cache_hit_rate=0.5,
+        )
+
+        self.assertEqual(
+            config.get_prefill_chunk_plan(concurrency=1),
+            [
+                PrefillChunk(index=0, query_len=50, seq_len=125),
+                PrefillChunk(index=1, query_len=25, seq_len=150, is_last_chunk=True),
+            ],
+        )
+
+    def test_optimizer_data_variable_prefill_chunk_plan_requires_concurrency(self):
+        config = OptimizerData(
+            length_distribution=_simple_length_distribution(),
+            max_batched_tokens=200,
+        )
+
+        with self.assertRaisesRegex(ValueError, "concurrency is required"):
+            config.get_prefill_chunk_plan()
+
+    def test_optimizer_data_prefill_chunk_plan_returns_empty_without_input_length(self):
+        config = OptimizerData(max_batched_tokens=None)
+
+        self.assertEqual(config.get_prefill_chunk_plan(), [])
+
+    def test_optimizer_data_auto_max_batched_tokens_uses_input_length(self):
+        config = OptimizerData(input_length=100)
+
+        self.assertEqual(config.get_auto_max_batched_tokens_candidates(), [400, 200, 100])
+
+    def test_optimizer_data_auto_max_batched_tokens_uses_distribution_when_input_length_missing(
+        self,
+    ):
+        config = OptimizerData(length_distribution=_simple_length_distribution())
+
+        self.assertEqual(config.get_auto_max_batched_tokens_candidates(), [2200, 1100, 550])
+
+    def test_optimizer_data_prefill_chunk_plan_rejects_invalid_token_budget(self):
+        for max_batched_tokens in (None, 0, -1):
+            with self.subTest(max_batched_tokens=max_batched_tokens):
+                config = OptimizerData(input_length=10, max_batched_tokens=max_batched_tokens)
+
+                with self.assertRaises(ValueError):
+                    config.get_prefill_chunk_plan()
+
+    def test_optimizer_data_prefill_num_chunks_matches_chunk_plan(self):
+        config = OptimizerData(input_length=9, max_batched_tokens=4)
+        chunk_plan = config.get_prefill_chunk_plan()
+
+        self.assertEqual(config.get_prefill_num_chunks(chunk_plan), 3)
+
+    def test_optimizer_data_effective_input_length_uses_distribution_midpoint_average(
+        self,
+    ):
+        config = OptimizerData(length_distribution=_simple_length_distribution())
+
+        self.assertEqual(config.get_effective_input_length(), 550)
+
+    def test_optimizer_data_effective_input_length_uses_distribution_after_prefix_cache(
+        self,
+    ):
+        config = OptimizerData(
+            length_distribution=_simple_length_distribution(),
+            prefix_cache_hit_rate=0.5,
+        )
+
+        self.assertEqual(config.get_effective_input_length(), 275)
+
+    def test_optimizer_data_effective_input_length_distribution_decode_stays_none(self):
+        config = OptimizerData(length_distribution=_simple_length_distribution())
+
+        self.assertIsNone(config.get_effective_input_length(is_decode=True))
+
+    def test_optimizer_data_decode_context_length_uses_distribution_before_prefix_cache(self):
+        config = OptimizerData(
+            length_distribution=_simple_length_distribution(),
+            prefix_cache_hit_rate=0.5,
+        )
+
+        self.assertEqual(config.get_decode_context_length(), 550)
+
+    def test_optimizer_data_prefill_cached_prefix_length_uses_distribution(self):
+        config = OptimizerData(
+            length_distribution=_simple_length_distribution(),
+            prefix_cache_hit_rate=0.5,
+        )
+
+        self.assertEqual(config.get_prefill_cached_prefix_length(), 275)
+
+    def test_optimizer_data_effective_input_length_distribution_has_minimum_one(self):
+        config = OptimizerData(
+            length_distribution=LengthDistribution(bins=[LengthBin(min_tokens=0, max_tokens=2, weight=1.0)]),
+            prefix_cache_hit_rate=0.999,
+        )
+
+        self.assertEqual(config.get_effective_input_length(), 1)
+
+    def test_build_concurrency_samples_uses_largest_remainder(self):
+        config = OptimizerData(
+            output_length=1,
+            length_distribution=LengthDistribution(
+                bins=[
+                    LengthBin(min_tokens=0, max_tokens=100, weight=0.5),
+                    LengthBin(min_tokens=100, max_tokens=200, weight=0.3),
+                    LengthBin(min_tokens=200, max_tokens=300, weight=0.2),
+                ]
+            ),
+        )
+
+        rows = config.build_concurrency_samples(7)
+
+        self.assertEqual([row["samples"] for row in rows], [4, 2, 1])
+        self.assertEqual(sum(row["samples"] for row in rows), 7)
+
+    def test_distribution_rows_include_midpoint_effective_length_and_ratio(self):
+        config = OptimizerData(
+            length_distribution=LengthDistribution(
+                bins=[
+                    LengthBin(min_tokens=0, max_tokens=100, weight=0.6),
+                    LengthBin(min_tokens=100, max_tokens=300, weight=0.4),
+                ]
+            ),
+            prefix_cache_hit_rate=0.5,
+        )
+
+        rows = config.get_representative_rows()
+
+        self.assertEqual(
+            rows,
+            [
+                {
+                    "num_input_tokens": 50,
+                    "query_len": 25,
+                    "request_ratio": 0.6,
+                },
+                {
+                    "num_input_tokens": 200,
+                    "query_len": 100,
+                    "request_ratio": 0.4,
+                },
+            ],
+        )
+
+    def test_distribution_rows_normalize_weights_when_sum_is_not_one(self):
+        config = OptimizerData(
+            length_distribution=LengthDistribution(
+                bins=[
+                    LengthBin(min_tokens=0, max_tokens=100, weight=3.0),
+                    LengthBin(min_tokens=100, max_tokens=300, weight=1.0),
+                ]
+            )
+        )
+
+        rows = config.get_representative_rows()
+
+        self.assertEqual(rows[0]["request_ratio"], 0.75)
+        self.assertEqual(rows[1]["request_ratio"], 0.25)
+
+    def test_effective_input_length_uses_normalized_distribution_weights(self):
+        config = OptimizerData(
+            length_distribution=LengthDistribution(
+                bins=[
+                    LengthBin(min_tokens=0, max_tokens=100, weight=3.0),
+                    LengthBin(min_tokens=100, max_tokens=300, weight=1.0),
+                ]
+            )
+        )
+
+        self.assertEqual(config.get_effective_input_length(), 87)
+
+    def test_build_concurrency_samples_normalizes_weights(self):
+        config = OptimizerData(
+            output_length=1,
+            length_distribution=LengthDistribution(
+                bins=[
+                    LengthBin(min_tokens=0, max_tokens=100, weight=3.0),
+                    LengthBin(min_tokens=100, max_tokens=300, weight=1.0),
+                ]
+            ),
+        )
+
+        rows = config.build_concurrency_samples(8)
+
+        self.assertEqual([row["samples"] for row in rows], [6, 2])
+        self.assertEqual(sum(row["samples"] for row in rows), 8)
+
+    def test_build_concurrency_samples_returns_query_len_and_num_input_tokens(self):
+        config = OptimizerData(
+            output_length=5,
+            length_distribution=LengthDistribution(bins=[LengthBin(min_tokens=0, max_tokens=100, weight=1.0)]),
+        )
+
+        rows = config.build_concurrency_samples(3)
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["num_input_tokens"], 50)
+        self.assertEqual(rows[0]["query_len"], 50)
+        self.assertEqual(rows[0]["samples"], 3)
+
+
+def test_load_length_distribution_success():
+    path = Path("serving_cast/example/length_distribution.yaml")
+
+    distribution = load_length_distribution(path)
+
+    assert len(distribution.bins) > 1
+    assert distribution.bins[0] == LengthBin(
+        min_tokens=0,
+        max_tokens=500,
+        weight=0.24718176439266218,
+    )
+
+
+def test_load_length_distribution_rejects_overlapping_bins(tmp_path):
+    path = tmp_path / "bad.yaml"
+    path.write_text(
+        "bins:\n"
+        "  - min_tokens: 0\n"
+        "    max_tokens: 500\n"
+        "    weight: 0.5\n"
+        "  - min_tokens: 400\n"
+        "    max_tokens: 900\n"
+        "    weight: 0.5\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        load_length_distribution(path)
+
+
+def test_load_length_distribution_rejects_malformed_top_level(tmp_path):
+    path = tmp_path / "bad_top_level.yaml"
+    path.write_text("- bins\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="mapping"):
+        load_length_distribution(path)
+
+
+def test_load_length_distribution_rejects_missing_required_key(tmp_path):
+    path = tmp_path / "missing_key.yaml"
+    path.write_text(
+        "bins:\n  - min_tokens: 0\n    weight: 1.0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing required key"):
+        load_length_distribution(path)
+
+
+def test_load_length_distribution_rejects_empty_bins(tmp_path):
+    path = tmp_path / "empty_bins.yaml"
+    path.write_text("bins: []\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="at least one bin"):
+        load_length_distribution(path)
+
+
+def test_load_length_distribution_accepts_invalid_weights_sum(tmp_path):
+    path = tmp_path / "bad_weights.yaml"
+    path.write_text(
+        "bins:\n"
+        "  - min_tokens: 0\n"
+        "    max_tokens: 500\n"
+        "    weight: 0.2\n"
+        "  - min_tokens: 500\n"
+        "    max_tokens: 1000\n"
+        "    weight: 0.2\n",
+        encoding="utf-8",
+    )
+
+    distribution = load_length_distribution(path)
+
+    assert distribution.bins == [
+        LengthBin(min_tokens=0, max_tokens=500, weight=0.2),
+        LengthBin(min_tokens=500, max_tokens=1000, weight=0.2),
+    ]
+
+
+class TestBatchRangeAction(unittest.TestCase):
+    """Test BatchRangeAction class functionality"""
+
+    def setUp(self):
+        """Set up test fixtures before each test method."""
+        self.parser = argparse.ArgumentParser()
+        self.namespace = argparse.Namespace()
+        self.action = BatchRangeAction(option_strings=["--batch-range"], dest="batch_range")
+
+    def test_valid_single_value(self):
+        """Test BatchRangeAction with valid single value"""
+        parser = argparse.ArgumentParser()
+        namespace = argparse.Namespace()
+
+        # Test single value (e.g., --batch-range 100)
+        self.action(parser, namespace, [100])
+        self.assertEqual(namespace.batch_range, [100])
+
+    def test_valid_range_values(self):
+        """Test BatchRangeAction with valid range values"""
+        parser = argparse.ArgumentParser()
+        namespace = argparse.Namespace()
+
+        # Test range values (e.g., --batch-range 10 100)
+        self.action(parser, namespace, [10, 100])
+        self.assertEqual(namespace.batch_range, [10, 100])
+
+    def test_invalid_range_order(self):
+        """Test BatchRangeAction with invalid range order"""
+        parser = argparse.ArgumentParser()
+        namespace = argparse.Namespace()
+
+        # Test with min > max (should raise ArgumentTypeError)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            self.action(parser, namespace, [100, 10])
+
+
+class TestFormatParallelLabel(unittest.TestCase):
+    """M5: the output parallel label surfaces DCP only when it is enabled."""
+
+    def test_label_omits_dcp_when_disabled(self):
+        pc = ParallelConfig(world_size=8, tensor_parallel_size=8, decode_context_parallel_size=1)
+        label = format_parallel_label(pc, is_moe_model=False)
+        self.assertEqual(label, "TP=8 | PP=1 | DP=1")
+        self.assertNotIn("DCP", label)
+
+    def test_label_includes_dcp_when_enabled(self):
+        pc = ParallelConfig(world_size=8, tensor_parallel_size=8, decode_context_parallel_size=4)
+        label = format_parallel_label(pc, is_moe_model=False)
+        self.assertEqual(label, "TP=8 | PP=1 | DP=1 | DCP=4")
+
+    def test_label_includes_dcp_after_moe_fields(self):
+        pc = ParallelConfig(
+            world_size=8,
+            tensor_parallel_size=8,
+            expert_parallel_size=8,
+            moe_data_parallel_size=1,
+            decode_context_parallel_size=2,
+        )
+        label = format_parallel_label(pc, is_moe_model=True)
+        self.assertTrue(label.endswith("DCP=2"))
+        self.assertIn("EP=8", label)
+
+    def test_label_dspark_clamps_acceptance_to_n(self):
+        pc = ParallelConfig(world_size=1, tensor_parallel_size=1)
+        # B=8 → n=7; raw accept=99 must display as 7.
+        label = format_parallel_label(
+            pc,
+            is_moe_model=False,
+            dspark_block_size=8,
+            dspark_acceptance_length=99.0,
+            dspark_markov_rank=256,
+        )
+        self.assertEqual(label, "TP=1 | PP=1 | DP=1 | DSpark=8/acc=7/markov=256")
+
+    def test_label_dflash_clamps_acceptance_to_n(self):
+        pc = ParallelConfig(world_size=1, tensor_parallel_size=1)
+        label = format_parallel_label(
+            pc,
+            is_moe_model=False,
+            dflash_block_size=4,
+            dflash_acceptance_length=99.0,
+        )
+        self.assertEqual(label, "TP=1 | PP=1 | DP=1 | DFlash=4/acc=3")
+
+    def test_label_unified_mtp_renders_clamped_acceptance(self):
+        pc = ParallelConfig(world_size=1, tensor_parallel_size=1)
+        label = format_parallel_label(
+            pc,
+            is_moe_model=False,
+            num_mtp_tokens=2,
+            mtp_acceptance_length=99.0,
+        )
+        self.assertEqual(label, "TP=1 | PP=1 | DP=1 | MTP=2/acc=2")
+
+    def test_label_legacy_mtp_keeps_bare_count(self):
+        pc = ParallelConfig(world_size=1, tensor_parallel_size=1)
+        label = format_parallel_label(pc, is_moe_model=False, num_mtp_tokens=2)
+        self.assertEqual(label, "TP=1 | PP=1 | DP=1 | MTP=2")

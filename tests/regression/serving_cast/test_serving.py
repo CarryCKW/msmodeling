@@ -1,0 +1,519 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2025-2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+import unittest
+from unittest.mock import Mock, patch
+
+from serving_cast import stime
+from serving_cast.config import (
+    CommunicationConfig,
+    Config,
+    InstanceConfig,
+    ParallelConfig,
+)
+from serving_cast.instance import Instance
+from serving_cast.load_gen import FixedLengthLoadGen
+from serving_cast.request import Request, RequestState
+from serving_cast.serving import PdAggregationServing, PdDisaggregationServing
+from serving_cast.utils import main_processing
+from tests.helpers.assert_utils import assert_latency_within
+from tests.helpers.config_factory import build_latency_thresholds
+
+
+class ServingTestCase(unittest.TestCase):
+    def setUp(self):
+        stime.init_simulation()
+        self.mock_cfg = Mock()
+        self.mock_cfg.common_config.serving_config.max_concurrency = 100
+        self.mock_cfg.common_config.serving_config.block_size = 128
+        self.mock_cfg.common_config.serving_config.max_tokens_budget = 8192
+        self.mock_cfg.common_config.model_config.name = "dummy-serving-model"
+        self.mock_cfg.common_config.model_config.num_mtp_tokens = 0
+        self.mock_cfg.common_config.model_config.mtp_acceptance_rate = []
+        self.mock_cfg.common_config.model_config.enable_multi_process = False
+        self.mock_cfg.enable_profiling = False
+        self.mock_cfg.common_config.model_config.enable_multi_process = False
+        self.mock_cfg.common_config.model_config.enable_interpolate = False
+        self.mock_cfg.common_config.model_config.enable_preprocessing_modeling = False
+        self.mock_cfg.common_config.model_config.enable_kv_transfer_modeling = False
+        self.mock_cfg.common_config.model_config.fusion_plugins = None
+
+        self.patch_get_instance = patch.object(Config, "get_instance")
+        mock_get_instance = self.patch_get_instance.start()
+        mock_get_instance.return_value = self.mock_cfg
+
+        self.dummy_duration = {"analytic": 0.3}
+        self.fake_ret = Mock()
+        self.fake_ret.execution_time_s = self.dummy_duration
+        self.fake_ret.device_memory_available_gb = 40.0
+        self.fake_ret.kv_cache_size_gb = 0
+        self.fake_ret.kv_cache_per_token_gb = 0.001
+        self.fake_ret.kv_cache_token_capacity_factor = 1
+        self.latency_thresholds = build_latency_thresholds(
+            ttft_ms=self.dummy_duration["analytic"],
+            tpot_ms=self.dummy_duration["analytic"],
+            tolerance_ms=0.1,
+        )
+
+        self.patch_model_runner = patch(
+            "serving_cast.model_runner.TensorCastModelRunner",
+        )
+        mock_model_runner = self.patch_model_runner.start()
+        self.mock_engine = mock_model_runner.return_value
+        self.mock_engine.run_inference.return_value = self.fake_ret
+
+    def tearDown(self):
+        self.patch_get_instance.stop()
+        self.patch_model_runner.stop()
+
+    def test_admission_uses_active_request_count(self):
+        self.mock_cfg.common_config.serving_config.max_concurrency = 2
+        instance = Mock()
+        instance.get_work_load.return_value = 2048
+        instance.get_in_flight_request_count.return_value = 0
+        serving = PdAggregationServing([instance])
+        requests = [Request(id=1000), Request(id=1000)]
+
+        for request in requests:
+            request.state = RequestState.LEAVES_CLIENT
+            serving.serve(request)
+
+        self.assertEqual(len(serving.active_requests), 2)
+        self.assertTrue(serving.exceed_concurrency_limit())
+        self.assertEqual(serving.get_work_load(), 2048)
+
+        requests[0].state = RequestState.DECODE_DONE
+        self.assertEqual(len(serving.active_requests), 1)
+        self.assertFalse(serving.exceed_concurrency_limit())
+
+    def test_disaggregation_releases_active_request(self):
+        self.mock_cfg.common_config.serving_config.max_concurrency = 1
+        prefill_instance = Mock()
+        decode_instance = Mock()
+        prefill_instance.get_work_load.return_value = 2048
+        prefill_instance.get_in_flight_request_count.return_value = 0
+        decode_instance.get_work_load.return_value = 1
+        decode_instance.get_in_flight_request_count.return_value = 0
+        serving = PdDisaggregationServing([prefill_instance], [decode_instance])
+        request = Request()
+        request.state = RequestState.LEAVES_CLIENT
+
+        serving.serve(request)
+        self.assertTrue(serving.exceed_concurrency_limit())
+
+        request.state = RequestState.DECODE_DONE
+        self.assertFalse(serving.exceed_concurrency_limit())
+
+    def test_rejected_request_does_not_leak_active_slot(self):
+        self.mock_cfg.common_config.serving_config.max_concurrency = 1
+        prefill_instance = Mock()
+        decode_instance = Mock()
+        for instance in (prefill_instance, decode_instance):
+            instance.get_work_load.return_value = 0
+            instance.get_in_flight_request_count.return_value = 0
+        prefill_instance.handle.side_effect = ValueError("request rejected")
+
+        servings = (
+            PdAggregationServing([prefill_instance]),
+            PdDisaggregationServing([prefill_instance], [decode_instance]),
+        )
+        for serving in servings:
+            request = Request()
+            request.state = RequestState.LEAVES_CLIENT
+            with self.subTest(serving=type(serving).__name__), self.assertRaisesRegex(ValueError, "request rejected"):
+                serving.serve(request)
+
+            self.assertNotIn(request, serving.active_requests)
+            self.assertFalse(serving.exceed_concurrency_limit())
+
+    def test_fixed_length_load_gen_request_rate_boundaries(self):
+        load_gen = FixedLengthLoadGen(
+            model_name="test-model",
+            num_requests=1,
+            num_input_tokens=1,
+            num_output_tokens=1,
+            request_rate=0,
+        )
+        request, interval = load_gen.next_request()
+        self.assertEqual(interval, 0)
+        # next_request only pops an attempt; the request stays at the client
+        # (INITIAL) until it actually obtains a concurrency slot.
+        self.assertEqual(request.state, RequestState.INITIAL)
+
+        with self.assertRaisesRegex(ValueError, "request_rate must be non-negative"):
+            FixedLengthLoadGen(
+                model_name="test-model",
+                num_requests=1,
+                num_input_tokens=1,
+                num_output_tokens=1,
+                request_rate=-1,
+            )
+
+    def test_concurrency_gate_defers_client_departure(self):
+        # Fixed-clock regression test (request_rate=2, max_concurrency=4,
+        # 8 requests): while the server concurrency gate is full a request
+        # must stay at the client. LEAVES_CLIENT is recorded only once the
+        # request actually obtains a concurrency slot, so the per-request
+        # timers (CLIENT_TTFT / ADMISSION_WAIT / E2E_TIME) start at the real
+        # send time, matching AIPerf's per-request records.
+        self.mock_cfg.common_config.serving_config.max_concurrency = 4
+        instance_config = InstanceConfig(
+            num_instances=1,
+            num_devices_per_instance=4,
+            device_type="TEST_DEVICE",
+            pd_role="prefill_decode",
+            parallel_config=ParallelConfig(tp_size=4, dp_size=1),
+            communication_config=CommunicationConfig(),
+        )
+        serving = PdAggregationServing([Instance(instance_config)])
+        load_gen = FixedLengthLoadGen(
+            model_name=self.mock_cfg.common_config.model_config.name,
+            num_requests=8,
+            num_input_tokens=2048,
+            num_output_tokens=50,
+            request_rate=2.0,
+        )
+        # next_request pops in creation order, so ascending ids == attempt order.
+        attempt_order_ids = sorted(load_gen.requests)
+
+        stime.CallableTask(main_processing, serving, load_gen)
+        stime.start_simulation()
+
+        requests = load_gen.get_finished_requests()
+        self.assertEqual(len(requests), 8)
+        by_attempt = [requests[request_id] for request_id in attempt_order_ids]
+        for request in by_attempt:
+            self.assertEqual(request.num_decoded_tokens, 50)
+
+        # Requests 1-4 are admitted immediately at their attempt times.
+        for request, expected_departure in zip(by_attempt[:4], (0.0, 0.5, 1.0, 1.5)):
+            self.assertAlmostEqual(request.leaves_client_time, expected_departure, places=6)
+
+        # Request 5 and later must not leave the client before the gate
+        # releases them, i.e. only after one of the first four finishes.
+        first_slot_release = min(request.decode_done_time for request in by_attempt[:4])
+        for request in by_attempt[4:]:
+            self.assertGreaterEqual(request.leaves_client_time, first_slot_release)
+        # Queued requests are admitted in FIFO order.
+        self.assertTrue(
+            all(a.leaves_client_time <= b.leaves_client_time for a, b in zip(by_attempt[4:], by_attempt[5:]))
+        )
+
+        # Client-side queuing is excluded from the metrics: departure and
+        # server arrival coincide for every request.
+        for request in by_attempt:
+            self.assertEqual(request.arrives_server_time, request.leaves_client_time)
+
+    def test_zero_rate_batches_requests_before_scheduler_runs(self):
+        self.mock_cfg.common_config.serving_config.max_concurrency = 11
+        instance_config = InstanceConfig(
+            num_instances=1,
+            num_devices_per_instance=4,
+            device_type="TEST_DEVICE",
+            pd_role="prefill_decode",
+            parallel_config=ParallelConfig(tp_size=4, dp_size=1),
+            communication_config=CommunicationConfig(),
+        )
+        inference_batches = []
+
+        def record_batch(batch, with_sampler=True):
+            if not (len(batch) == 1 and batch[0].num_input_tokens == 8192):
+                inference_batches.append(list(batch))
+            return self.fake_ret
+
+        self.mock_engine.run_inference.side_effect = record_batch
+        serving = PdAggregationServing([Instance(instance_config)])
+        load_gen = FixedLengthLoadGen(
+            model_name=self.mock_cfg.common_config.model_config.name,
+            num_requests=11,
+            num_input_tokens=2048,
+            num_output_tokens=5,
+            request_rate=0,
+        )
+
+        stime.CallableTask(main_processing, serving, load_gen)
+        stime.start_simulation()
+
+        self.assertEqual(len(inference_batches[0]), 4)
+        self.assertTrue(all(request.query_len == 2048 for request in inference_batches[0]))
+
+    def test_pd_disaggregation_dummy_model(self):
+        prefill_instance_config = InstanceConfig(
+            num_instances=8,
+            num_devices_per_instance=4,
+            device_type="TEST_DEVICE",
+            pd_role="prefill",
+            parallel_config=ParallelConfig(
+                tp_size=2,
+                dp_size=2,
+                mlp_tp_size=None,
+                mlp_dp_size=None,
+                lmhead_tp_size=None,
+                lmhead_dp_size=None,
+            ),
+            communication_config=CommunicationConfig(
+                host2device_bandwidth=1e10,
+                host2device_rate=0.5,
+                device2device_bandwidth=4e9,
+                device2device_rate=0.5,
+            ),
+        )
+
+        decode_instance_config = InstanceConfig(
+            num_instances=8,
+            num_devices_per_instance=8,
+            device_type="TEST_DEVICE",
+            pd_role="decode",
+            parallel_config=ParallelConfig(
+                tp_size=4,
+                dp_size=2,
+                mlp_tp_size=None,
+                mlp_dp_size=None,
+                lmhead_tp_size=None,
+                lmhead_dp_size=None,
+            ),
+            communication_config=CommunicationConfig(
+                host2device_bandwidth=1e10,
+                host2device_rate=0.5,
+                device2device_bandwidth=4e9,
+                device2device_rate=0.5,
+            ),
+        )
+
+        prefill_instances = []
+        decode_instances = []
+        for _ in range(prefill_instance_config.num_instances):
+            prefill = Instance(prefill_instance_config)
+            prefill_instances.append(prefill)
+        for _ in range(decode_instance_config.num_instances):
+            decode = Instance(decode_instance_config)
+            decode_instances.append(decode)
+
+        num_requests = 10
+        num_input_tokens = 2048
+        num_output_tokens = 50
+        serving = PdDisaggregationServing(prefill_instances, decode_instances)
+        load_runner = FixedLengthLoadGen(
+            model_name=self.mock_cfg.common_config.model_config.name,
+            num_requests=num_requests,
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=num_output_tokens,
+            request_rate=1.0,
+        )
+
+        _ = stime.CallableTask(main_processing, serving, load_runner)
+
+        stime.start_simulation()
+        requests = load_runner.get_finished_requests()
+        # all requests have been served
+        self.assertEqual(len(requests), num_requests)
+
+        for request in requests.values():
+            assert_latency_within(
+                request.time_to_first_token(),
+                self.latency_thresholds["ttft_ms"],
+                tolerance_ms=self.latency_thresholds["tolerance_ms"],
+            )
+            self.assertEqual(request.num_decoded_tokens, num_output_tokens)
+            assert_latency_within(
+                request.time_per_output_token(),
+                self.latency_thresholds["tpot_ms"],
+                tolerance_ms=self.latency_thresholds["tolerance_ms"],
+            )
+
+    def test_pd_aggregation_dummy_model(self):
+        instance_config = InstanceConfig(
+            num_instances=8,
+            num_devices_per_instance=4,
+            device_type="TEST_DEVICE",
+            pd_role="prefill_decode",
+            parallel_config=ParallelConfig(
+                tp_size=2,
+                dp_size=2,
+                mlp_tp_size=None,
+                mlp_dp_size=None,
+                lmhead_tp_size=None,
+                lmhead_dp_size=None,
+            ),
+            communication_config=CommunicationConfig(
+                host2device_bandwidth=1e10,
+                host2device_rate=0.5,
+                device2device_bandwidth=4e9,
+                device2device_rate=0.5,
+            ),
+        )
+
+        prefill_decode_instances = [Instance(instance_config) for _ in range(instance_config.num_instances)]
+
+        num_requests = 10
+        num_input_tokens = 2048
+        num_output_tokens = 50
+        serving = PdAggregationServing(prefill_decode_instances)
+        load_runner = FixedLengthLoadGen(
+            model_name=self.mock_cfg.common_config.model_config.name,
+            num_requests=num_requests,
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=num_output_tokens,
+            request_rate=1.0,
+        )
+
+        _ = stime.CallableTask(main_processing, serving, load_runner)
+
+        stime.start_simulation()
+        requests = load_runner.get_finished_requests()
+        self.assertEqual(len(requests), num_requests)
+        for request in requests.values():
+            self.assertEqual(request.num_decoded_tokens, num_output_tokens)
+            assert_latency_within(
+                request.time_to_first_token(),
+                self.latency_thresholds["ttft_ms"],
+                tolerance_ms=self.latency_thresholds["tolerance_ms"],
+            )
+            assert_latency_within(
+                request.time_per_output_token(),
+                self.latency_thresholds["tpot_ms"],
+                tolerance_ms=self.latency_thresholds["tolerance_ms"],
+            )
+
+    def test_pd_aggregation_dummy_model_single_scheduler(self):
+        instance_config = InstanceConfig(
+            num_instances=1,
+            num_devices_per_instance=4,
+            device_type="TEST_DEVICE",
+            pd_role="prefill_decode",
+            parallel_config=ParallelConfig(
+                tp_size=4,
+                dp_size=1,
+                mlp_tp_size=None,
+                mlp_dp_size=None,
+                lmhead_tp_size=None,
+                lmhead_dp_size=None,
+            ),
+            communication_config=CommunicationConfig(
+                host2device_bandwidth=1e10,
+                host2device_rate=0.5,
+                device2device_bandwidth=4e9,
+                device2device_rate=0.5,
+            ),
+        )
+
+        prefill_decode_instances = [Instance(instance_config)]
+
+        num_requests = 100
+        num_input_tokens = 2048
+        num_output_tokens = 50
+        serving = PdAggregationServing(prefill_decode_instances)
+        load_runner = FixedLengthLoadGen(
+            model_name=self.mock_cfg.common_config.model_config.name,
+            num_requests=num_requests,
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=num_output_tokens,
+            request_rate=1.0,
+        )
+
+        _ = stime.CallableTask(main_processing, serving, load_runner)
+
+        stime.start_simulation()
+        requests = load_runner.get_finished_requests()
+        self.assertEqual(len(requests), num_requests)
+        for request in requests.values():
+            self.assertEqual(request.num_decoded_tokens, num_output_tokens)
+            assert_latency_within(
+                request.time_per_output_token(),
+                self.latency_thresholds["tpot_ms"],
+                tolerance_ms=self.latency_thresholds["tolerance_ms"],
+            )
+
+    def test_pd_aggregation_dummy_model_single_scheduler_trigger_preempt(self):
+        instance_config = InstanceConfig(
+            num_instances=1,
+            num_devices_per_instance=4,
+            device_type="TEST_DEVICE",
+            pd_role="prefill_decode",
+            parallel_config=ParallelConfig(
+                tp_size=1,
+                dp_size=4,
+                mlp_tp_size=None,
+                mlp_dp_size=None,
+                lmhead_tp_size=None,
+                lmhead_dp_size=None,
+            ),
+            communication_config=CommunicationConfig(
+                host2device_bandwidth=1e10,
+                host2device_rate=0.5,
+                device2device_bandwidth=4e9,
+                device2device_rate=0.5,
+            ),
+        )
+
+        prefill_decode_instances = [Instance(instance_config)]
+
+        num_requests = 100
+        num_input_tokens = 2048
+        num_output_tokens = 50
+        serving = PdAggregationServing(prefill_decode_instances)
+        load_runner = FixedLengthLoadGen(
+            model_name=self.mock_cfg.common_config.model_config.name,
+            num_requests=num_requests,
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=num_output_tokens,
+            request_rate=5.0,  # increase sending rate to trigger preempt
+        )
+
+        _ = stime.CallableTask(main_processing, serving, load_runner)
+
+        stime.start_simulation()
+        requests = load_runner.get_finished_requests()
+        self.assertEqual(len(requests), num_requests)
+        for request in requests.values():
+            self.assertEqual(request.num_decoded_tokens, num_output_tokens)
+
+    def test_exceed_concurrency_limit_counts_requests_not_tokens(self):
+        # issue #337: max_concurrency is a request-count budget. The gate must
+        # compare in-flight request count, not the token-weighted work load,
+        # otherwise a single long prefill (input tokens > max_concurrency)
+        # trips the gate and serializes high-concurrency prefill.
+        mock_instance = Mock()
+        mock_instance.get_work_load.return_value = 200
+        mock_instance.get_in_flight_request_count.return_value = 1
+
+        serving = PdAggregationServing([mock_instance])
+        self.assertFalse(serving.exceed_concurrency_limit())
+
+        max_concurrency = self.mock_cfg.common_config.serving_config.max_concurrency
+        mock_instance.get_in_flight_request_count.return_value = max_concurrency - 1
+        self.assertFalse(serving.exceed_concurrency_limit())
+
+        mock_instance.get_in_flight_request_count.return_value = max_concurrency
+        self.assertTrue(serving.exceed_concurrency_limit())
+
+    def test_exceed_concurrency_limit_aggregates_pd_instances(self):
+        # issue #337: P/D disaggregation gate aggregates in-flight requests
+        # across prefill and decode instances.
+        prefill_instance = Mock()
+        decode_instance = Mock()
+        prefill_instance.get_in_flight_request_count.return_value = 60
+        decode_instance.get_in_flight_request_count.return_value = 39
+
+        serving = PdDisaggregationServing([prefill_instance], [decode_instance])
+        self.assertFalse(serving.exceed_concurrency_limit())
+
+        decode_instance.get_in_flight_request_count.return_value = 40
+        self.assertTrue(serving.exceed_concurrency_limit())
+
+
+if __name__ == "__main__":
+    unittest.main()

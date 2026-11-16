@@ -1,0 +1,75 @@
+# -------------------------------------------------------------------------
+# This file is part of the MindStudio project.
+# Copyright (c) 2026 Huawei Technologies Co.,Ltd.
+#
+# MindStudio is licensed under Mulan PSL v2.
+# You can use this software according to the terms and conditions of the Mulan PSL v2.
+# You may obtain a copy of Mulan PSL v2 at:
+#
+#          http://license.coscl.org.cn/MulanPSL2
+#
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
+# EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
+# MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
+# See the Mulan PSL v2 for more details.
+# -------------------------------------------------------------------------
+
+from typing import Optional
+
+import torch
+
+
+# TODO(jgong5): add meaning for each configuration item
+class performance_model:
+    class empirical:
+        runtime_device_override: Optional[torch.device] = None
+        warmup_runs = 1
+        benchmark_runs = 10
+
+
+class compilation:
+    enable_freezing = True
+
+    class multistream:
+        enable = False
+        # Backward-compatible aliases; scheduling logic should read role_to_stream_ids.
+        compute_stream_id = 0
+        comm_stream_id = 1
+        # Role-based stream assignment. Keep defaults to 2 lanes while allowing future expansion.
+        role_to_stream_ids = {
+            "compute": (compute_stream_id,),
+            "comm": (comm_stream_id,),
+        }
+        cross_stream_sync_overhead_s = 0.0
+        # Enable analytic estimator for schedulable FX nodes when metadata is available.
+        enable_analytic_cost_model = True
+
+    class passes:
+        enable_life_combine_quant = True
+        enable_merge_linear = True
+        enable_sink_split = True
+        enable_sequence_parallel = False
+
+    class fusion_patterns:
+        enable_rms_norm = True
+        enable_rms_norm_quant = enable_rms_norm
+        enable_add_rms_norm = enable_rms_norm
+        enable_layer_norm = True
+        enable_modulated_layer_norm = True
+        enable_rope = True
+        enable_swiglu = True
+        enable_gelu = True
+        enable_silu = True
+        # Disabled by default until trace evidence provides a narrower residual-specific graph form.
+        enable_gated_residual_add = False
+        enable_matmul_allreduce = False
+        enable_grouped_matmul_swiglu = True
+        enable_dispatch_ffn_combine = False
+        enable_mlapo = False
+        # SiTU activation pattern.  Enabled by default; only models whose
+        # graphs contain the SiTU decomposition (e.g. Kimi K3) will match.
+        # Other models are unaffected — the pattern simply never fires.
+        enable_situ = True
+
+    class debug:
+        graph_log_url = None
